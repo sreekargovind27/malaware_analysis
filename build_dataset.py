@@ -462,6 +462,9 @@ def build_engineered_dataset():
     final_df = pd.concat(all_samples, ignore_index=True)
     del all_samples
 
+    final_df['local_orig'] = pd.to_numeric(final_df['local_orig'], errors='coerce').fillna(0).astype(np.int8)
+    final_df['local_resp'] = pd.to_numeric(final_df['local_resp'], errors='coerce').fillna(0).astype(np.int8)
+
     print(f"✓ Final dataset: {len(final_df):,} rows from {len(split_files)} files")
 
     print("\n⏳ Fixing column types...")
