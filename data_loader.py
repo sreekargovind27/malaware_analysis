@@ -19,8 +19,8 @@ from config import Config
 
 class IoTDataset(Dataset):
     def __init__(self, X, y=None):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.LongTensor(y) if y is not None else None
+        self.X = X  # <-- JUST ASSIGN IT DIRECTLY
+        self.y = y  # <-- JUST ASSIGN IT DIRECTLY
 
     def __len__(self):
         return len(self.X)
