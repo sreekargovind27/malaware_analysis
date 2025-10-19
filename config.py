@@ -106,7 +106,7 @@ class Config:
     KMEANS_BATCH_SIZE = 10000
     NUM_WORKERS = 0 if os.name == 'nt' else 4
     PIN_MEMORY = True
-    N_JOBS = -1
+    N_JOBS = 32
 
     # ==================== REPRODUCIBILITY ====================
     @staticmethod
