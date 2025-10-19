@@ -10,7 +10,7 @@ import torch
 class Config:
     # ==================== MODE SETTINGS ====================
     # Set to True for testing with smaller dataset, False for production
-    TEST_MODE = True  # <-- TOGGLE THIS
+    TEST_MODE = False  # <-- TOGGLE THIS
 
     # ==================== PATHS ====================
     # Dynamically choose raw directory based on test mode
