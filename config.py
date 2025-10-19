@@ -10,7 +10,7 @@ import torch
 class Config:
     # ==================== MODE SETTINGS ====================
     # Set to True for testing with smaller dataset, False for production
-    TEST_MODE = False  # <-- TOGGLE THIS
+    TEST_MODE = True  # <-- TOGGLE THIS
 
     # ==================== PATHS ====================
     # Dynamically choose raw directory based on test mode
@@ -93,7 +93,7 @@ class Config:
 
     AUTOENCODER_LATENT_DIM = 8
     AUTOENCODER_EPOCHS = 100
-    AUTOENCODER_BATCH_SIZE = 4096
+    AUTOENCODER_BATCH_SIZE = 32768  # 8x larger
     AUTOENCODER_LR = 0.0001
     ANOMALY_THRESHOLD_PERCENTILE = 85
     BINARY_N_ESTIMATORS = 200
@@ -104,7 +104,7 @@ class Config:
     MULTICLASS_MAX_DEPTH = 10
     KMEANS_N_CLUSTERS = 5
     KMEANS_BATCH_SIZE = 10000
-    NUM_WORKERS = 0 if os.name == 'nt' else 4
+    NUM_WORKERS = 0 if os.name == 'nt' else 16
     PIN_MEMORY = True
     N_JOBS = 32
 

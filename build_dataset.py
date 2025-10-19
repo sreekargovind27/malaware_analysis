@@ -18,10 +18,10 @@ from tqdm import tqdm
 from config import Config
 
 # ==================== OPTIMIZATION 1: LARGER CHUNK SIZE ====================
-CHUNK_SIZE = 7000000  # 7 mil
+CHUNK_SIZE = 1000000  # 1 mil
 
 # ==================== OPTIMIZATION 2: USE ALL CPU CORES ====================
-MAX_WORKERS = min(8, cpu_count() - 1)
+MAX_WORKERS = min(16, cpu_count() - 1)
 
 
 # ==================== MOVE TO MODULE LEVEL FOR PICKLING ====================
@@ -236,7 +236,7 @@ def _preprocess_partition(df, all_categorical_values):
             df[col] = 0
             continue
         df[col] = df[col].fillna('unknown').astype(str).replace(['', '-', 'nan', 'None'], 'unknown')
-        df[col] = pd.Categorical(df[col]).codes
+        df[col] = pd.Categorical(df[col]).codes.astype(np.int32)
 
     for col in Config.CATEGORICAL_ONE_HOT_ENCODE:
         if col not in df.columns:
@@ -289,14 +289,15 @@ def _preprocess_partition(df, all_categorical_values):
 
 
 def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values):
-    """OPTIMIZED: Larger chunks + faster I/O"""
-    output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR, os.path.basename(file_path))
+    """OPTIMIZED: Write Parquet instead of CSV"""
+    output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR,
+                                os.path.basename(file_path).replace('.csv', '.parquet'))
 
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"\n  📄 {os.path.basename(file_path)} ({file_size_mb:.1f} MB)")
 
     t_start = time.time()
-    first_chunk = True
+    chunks_list = []
     total_rows = 0
 
     for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE, low_memory=False, on_bad_lines='skip'):
@@ -314,10 +315,13 @@ def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
             if Config.DETAILED_TARGET_COL not in processed.columns:
                 processed[Config.DETAILED_TARGET_COL] = 'Unknown'
 
-        processed.to_csv(output_path, mode='w' if first_chunk else 'a',
-                         header=first_chunk, index=False)
-        first_chunk = False
+        chunks_list.append(processed)
         total_rows += len(processed)
+
+    # Write once as Parquet (much faster than CSV appending)
+    if chunks_list:
+        final_df = pd.concat(chunks_list, ignore_index=True)
+        final_df.to_parquet(output_path, engine='pyarrow', compression='snappy', index=False)
 
     t_elapsed = time.time() - t_start
     throughput = file_size_mb / t_elapsed if t_elapsed > 0 else 0
@@ -325,7 +329,6 @@ def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
     print(f"    ✅ {total_rows:,} rows | {t_elapsed:.1f}s | {throughput:.1f} MB/s")
 
     return total_rows
-
 
 def build_engineered_dataset():
     """OPTIMIZED: Parallel file processing"""
@@ -362,14 +365,15 @@ def build_engineered_dataset():
     files_to_process = []
     for file_path in csv_files:
         base_name = os.path.basename(file_path)
-        output_path = os.path.join(split_output_dir, base_name)
+        output_path = os.path.join(split_output_dir, base_name.replace('.csv', '.parquet'))  # ← Look for .parquet
 
         if os.path.exists(output_path):
             files_skipped += 1
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             print(f"  ⭐️ {base_name} ({file_size_mb:.1f} MB) - Already processed")
             try:
-                existing_rows = sum(1 for _ in open(output_path)) - 1
+                existing_df = pd.read_parquet(output_path)
+                existing_rows = len(existing_df)
                 total_rows += existing_rows
             except:
                 pass
@@ -409,7 +413,7 @@ def build_engineered_dataset():
     print("=" * 70)
 
     stage2_start = time.time()
-    split_files = glob.glob(os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.csv'))
+    split_files = glob.glob(os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet'))
 
     if not split_files:
         print("❌ No engineered files found")
@@ -419,11 +423,8 @@ def build_engineered_dataset():
 
     try:
         print("\n⏳ Reading with Dask...")
-        ddf = dd.read_csv(
-            os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.csv'),
-            blocksize='256MB',
-            assume_missing=True,
-            dtype={'attack_subtype': 'object'}
+        ddf = dd.read_parquet(
+            os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet')
         )
 
         if Config.SAMPLE_SIZE:

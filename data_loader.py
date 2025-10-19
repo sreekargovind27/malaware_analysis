@@ -158,16 +158,20 @@ def get_data_for_autoencoder():
 
     train_loader = DataLoader(
         IoTDataset(X_train),
-        batch_size=Config.AUTOENCODER_BATCH_SIZE,
+        batch_size=Config.AUTOENCODER_BATCH_SIZE,  # Larger batch
         shuffle=True,
-        num_workers=Config.NUM_WORKERS
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,          # ← ADD THIS
+        persistent_workers=True   # ← ADD THIS
     )
 
     val_loader = DataLoader(
         IoTDataset(X_val),
         batch_size=Config.AUTOENCODER_BATCH_SIZE,
         shuffle=False,
-        num_workers=Config.NUM_WORKERS
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,          # ← ADD THIS
+        persistent_workers=True   # ← ADD THIS
     )
 
     t_loader = time.time() - t_loader_start
