@@ -161,16 +161,16 @@ class MultiClassNeuralNetModel:
         X_val_scaled = scaler.transform(X_val)
 
         def objective(trial):
+            print(f"\n--- Starting Optuna Trial #{trial.number} ---")
             n_layers = trial.suggest_int('n_layers', 2, 4)
             hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
             batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384])
+            print(f"  > Params: Layers={hidden_layers}, Batch={batch_size}, LR={learning_rate:.5f}")
 
-            # THIS FIX PREVENTS THE 't < n_classes' ERROR
             num_classes_for_trial = len(np.unique(y_train))
-
             temp_model = MultiClassNeuralNet(self.input_dim, num_classes_for_trial, hidden_layers, dropout_rate,
                                              use_batch_norm).to(self.device)
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
@@ -180,7 +180,9 @@ class MultiClassNeuralNetModel:
             val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False)
 
             best_val_acc = 0.0
-            for epoch in range(15):  # Reduced epochs for faster trials
+            # Adding back tqdm for the inner loop
+            for epoch in tqdm(range(15), desc=f"  > Trial #{trial.number}",
+                              leave=False):  # Reduced epochs for faster trials
                 temp_model.train()
                 for X_batch, y_batch in train_loader:
                     X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
@@ -189,7 +191,8 @@ class MultiClassNeuralNetModel:
                     loss = temp_criterion(outputs, y_batch);
                     loss.backward();
                     temp_optimizer.step()
-                temp_model.eval();
+
+                temp_model.eval()
                 val_correct, val_total = 0, 0
                 with torch.no_grad():
                     for X_batch, y_batch in val_loader:
@@ -200,11 +203,18 @@ class MultiClassNeuralNetModel:
                         val_correct += (predicted == y_batch).sum().item()
                 val_acc = val_correct / val_total
                 if val_acc > best_val_acc: best_val_acc = val_acc
+
+            print(f"  > Trial #{trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
             torch.cuda.empty_cache()
             return best_val_acc
 
-        study = optuna.create_study(direction='maximize');
-        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT)
+        study = optuna.create_study(direction='maximize')
+
+        # ============================================================================
+        # TODO: CHANGE n_trials back to Config.OPTUNA_N_TRIALS for a full run
+        study.optimize(objective, n_trials=1, timeout=Config.OPTUNA_TIMEOUT, show_progress_bar=True)
+        # ============================================================================
+
         self.best_params = study.best_params;
         return study.best_params
 
@@ -236,16 +246,19 @@ class MultiClassNeuralNetModel:
 
         best_val_acc = 0;
         patience_counter = 0
-        progress_bar = tqdm(range(50), desc="Training")
+        progress_bar = tqdm(range(50), desc="Training Final Model")
         for epoch in progress_bar:
             self.model.train()
+            total_loss = 0
             for X_batch, y_batch in train_loader:
                 X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                 self.optimizer.zero_grad();
                 outputs = self.model(X_batch);
                 loss = self.criterion(outputs, y_batch);
                 loss.backward();
-                temp_optimizer.step()
+                self.optimizer.step()
+                total_loss += loss.item()
+
             self.model.eval();
             val_correct, val_total = 0, 0
             with torch.no_grad():
@@ -256,6 +269,10 @@ class MultiClassNeuralNetModel:
                     val_total += y_batch.size(0);
                     val_correct += (predicted == y_batch).sum().item()
             val_acc = val_correct / val_total
+
+            # Update the main progress bar description with metrics
+            progress_bar.set_postfix(loss=f"{total_loss / len(train_loader):.4f}", val_acc=f"{val_acc:.4f}")
+
             if val_acc > best_val_acc:
                 best_val_acc = val_acc;
                 patience_counter = 0;
