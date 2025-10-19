@@ -726,7 +726,7 @@ if __name__ == "__main__":
     print("🎉 MULTI-CLASS CLASSIFICATION COMPLETE")
     print("=" * 70)
     print(f"\n📊 Model Comparison:")
-    print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
+    # print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
     print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
     print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")
