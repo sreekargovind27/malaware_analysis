@@ -630,7 +630,12 @@ class MultiClassNeuralNetModel:
         if not os.path.exists(filepath):
             print(f"❌ Model file {filepath} not found")
             return
+
+        # =================================================================
+        # ADD weights_only=False HERE
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        # =================================================================
+
         self.model.load_state_dict(checkpoint['model_state'])
         self.scaler = checkpoint['scaler']
         self.num_classes = checkpoint['num_classes']

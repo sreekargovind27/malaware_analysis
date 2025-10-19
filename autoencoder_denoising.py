@@ -256,7 +256,10 @@ class DenoisingAutoencoderModel:
         """Load model"""
         filepath = os.path.join(Config.MODELS_DIR, filename)
         if os.path.exists(filepath):
+            # =================================================================
+            # ADD weights_only=False HERE
             checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+            # =================================================================
             self.model.load_state_dict(checkpoint['model_state'])
             self.threshold = checkpoint.get('threshold')
             self.scaler = checkpoint.get('scaler')

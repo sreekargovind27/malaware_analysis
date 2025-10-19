@@ -460,7 +460,11 @@ class AutoencoderModel:
             print(f"❌ Model file {filepath} not found")
             return
 
+        # =================================================================
+        # ADD weights_only=False HERE
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        # =================================================================
+
         self.model.load_state_dict(checkpoint['model_state'])
         if 'optimizer_state' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state'])
