@@ -1,7 +1,7 @@
 """
 Multi-Class Classification: Attack Type Detection
 Uses XGBoost and PyTorch Neural Network with SMOTE and Optuna optimization.
-UPDATED: Added Optuna tuning for Neural Network + detailed timing + enhanced progress tracking.
+UPDATED: Added Optuna tuning for Neural Network + detailed timing + F***ING MORE PRINTS.
 """
 
 import os
@@ -120,6 +120,8 @@ class MultiClassXGBoost:
         print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
 
         def objective(trial):
+            # ADDED: Print to track start of XGBoost trial
+            print(f"\n--- [XGBoost] Starting Optuna Trial {trial.number} ---")
             param = {'objective': 'multi:softmax', 'num_class': self.num_classes, 'tree_method': 'hist',
                      'n_estimators': trial.suggest_int('n_estimators', 50, 300),
                      'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
@@ -131,10 +133,21 @@ class MultiClassXGBoost:
                      'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
                      'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True), 'n_jobs': Config.N_JOBS,
                      'random_state': Config.RANDOM_STATE, 'eval_metric': 'mlogloss'}
+
+            # ADDED: Print params being used for this trial
+            print(f"  - Params: n_estimators={param['n_estimators']}, max_depth={param['max_depth']}, lr={param['learning_rate']:.4f}")
+            print("  - Training model...")
+
             model = xgb.XGBClassifier(**param)
             model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+            print("  - Evaluating...")
             y_pred = model.predict(X_val)
-            return accuracy_score(y_val, y_pred)
+            accuracy = accuracy_score(y_val, y_pred)
+
+            # ADDED: Print result of the trial
+            print(f"--- [XGBoost] Trial {trial.number} finished. Accuracy: {accuracy:.4f} ---")
+            return accuracy
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
         study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -329,13 +342,15 @@ class MultiClassNeuralNetModel:
         print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
 
         # Scale data once for all trials
+        print("   Scaling data for Optuna...")
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
+        print("   ✓ Data scaled.")
 
         def objective(trial):
             # ADDED: Print statement to track which trial is starting
-            print(f"\n--- Starting Optuna Trial {trial.number} ---")
+            print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
 
             # Suggest architecture
             n_layers = trial.suggest_int('n_layers', 2, 4)
@@ -365,6 +380,7 @@ class MultiClassNeuralNetModel:
             temp_criterion = nn.CrossEntropyLoss()
 
             # Create data loaders
+            print("  - Creating DataLoaders...") # ADDED
             train_loader = DataLoader(
                 IoTDataset(X_train_scaled, y_train),
                 batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS
@@ -373,6 +389,7 @@ class MultiClassNeuralNetModel:
                 IoTDataset(X_val_scaled, y_val),
                 batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS
             )
+            print("  - ✓ DataLoaders created. Starting training...") # ADDED
 
             # Train for limited epochs
             num_epochs = min(20, 50)
@@ -427,7 +444,7 @@ class MultiClassNeuralNetModel:
                     raise optuna.TrialPruned()
 
             # ADDED: Print statement to confirm trial completion
-            print(f"--- Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
+            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
             return best_val_acc
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
@@ -700,13 +717,13 @@ if __name__ == "__main__":
     X_val_np = X_val.values
 
     # Train XGBoost
-    # print("\n" + "=" * 70)
-    # print("MODEL 1: XGBoost")
-    # print("=" * 70)
-    # xgb_model = MultiClassXGBoost()
-    # xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
-    # xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
-    # xgb_model.save_model()
+    print("\n" + "=" * 70)
+    print("MODEL 1: XGBoost")
+    print("=" * 70)
+    xgb_model = MultiClassXGBoost()
+    xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
+    xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
+    xgb_model.save_model()
 
     # Train Neural Network with Optuna
     print("\n" + "=" * 70)
@@ -726,7 +743,7 @@ if __name__ == "__main__":
     print("🎉 MULTI-CLASS CLASSIFICATION COMPLETE")
     print("=" * 70)
     print(f"\n📊 Model Comparison:")
-    # print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
+    print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
     print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
     print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")
