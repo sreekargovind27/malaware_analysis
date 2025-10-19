@@ -258,6 +258,8 @@ class VirusClassifier:
 
 if __name__ == "__main__":
     Config.set_seeds()
+    Config.print_mode_info()
+
     print("=" * 70);
     print("🦠 MALWARE FAMILY CLASSIFICATION");
     print("=" * 70)

@@ -171,8 +171,9 @@ class KMeansClustering:
         X_pca = pca.fit_transform(X_scaled)
         t_pca = time.time() - t_pca_start
         print(f"✓ PCA complete ({t_pca:.2f}s)")
-        print(f"   Explained variance: PC1={pca.explained_variance_ratio_[0]*100:.1f}%, PC2={pca.explained_variance_ratio_[1]*100:.1f}%")
-        print(f"   Total: {sum(pca.explained_variance_ratio_)*100:.1f}%")
+        print(
+            f"   Explained variance: PC1={pca.explained_variance_ratio_[0] * 100:.1f}%, PC2={pca.explained_variance_ratio_[1] * 100:.1f}%")
+        print(f"   Total: {sum(pca.explained_variance_ratio_) * 100:.1f}%")
 
         print(f"\n⏳ Creating visualization...")
         t_plot_start = time.time()
@@ -181,15 +182,15 @@ class KMeansClustering:
 
         # Left plot: K-Means clusters
         scatter1 = ax1.scatter(X_pca[:, 0], X_pca[:, 1], c=self.labels, cmap='viridis', alpha=0.6, s=20)
-        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% variance)', fontsize=12)
-        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% variance)', fontsize=12)
+        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}% variance)', fontsize=12)
+        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}% variance)', fontsize=12)
         ax1.set_title('K-Means Clusters (Unsupervised)', fontsize=14, fontweight='bold')
         plt.colorbar(scatter1, ax=ax1, label='K-Means Cluster')
 
         # Right plot: True labels
         scatter2 = ax2.scatter(X_pca[:, 0], X_pca[:, 1], c=true_labels, cmap='Set1', alpha=0.6, s=20)
-        ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% variance)', fontsize=12)
-        ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% variance)', fontsize=12)
+        ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}% variance)', fontsize=12)
+        ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}% variance)', fontsize=12)
         ax2.set_title('True Malware Labels (Supervised)', fontsize=14, fontweight='bold')
 
         if label_names is not None and len(label_names) > 0:
@@ -243,6 +244,7 @@ class KMeansClustering:
 
 if __name__ == "__main__":
     Config.set_seeds()
+    Config.print_mode_info()
 
     print("=" * 70)
     print("🔬 K-MEANS CLUSTERING ON MALICIOUS TRAFFIC")
@@ -295,7 +297,7 @@ if __name__ == "__main__":
             print("\n" + "=" * 70)
             print("🎉 K-MEANS CLUSTERING COMPLETE")
             print("=" * 70)
-            print(f"⏱️  Total pipeline time: {total_time:.2f}s ({total_time/60:.1f} min)")
+            print(f"⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
             print("\n✅ Clustering model trained and saved successfully!")
         else:
             print("\n❌ Clustering failed - fit() returned None")

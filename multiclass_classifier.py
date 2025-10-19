@@ -6,28 +6,25 @@ UPDATED: Added detailed timing, SMOTE for imbalance, and Optuna tuning.
 
 import os
 import time
+
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
+# Optuna imports
+import optuna
 import seaborn as sns
 import torch
 import torch.nn as nn
 import xgboost as xgb
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
 # SMOTE imports
 from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import RandomUnderSampler
-from imblearn.pipeline import Pipeline as ImbPipeline
-
-# Optuna imports
-import optuna
 from optuna.samplers import TPESampler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from config import Config
 from data_loader import get_data_for_multiclass, IoTDataset
@@ -252,6 +249,7 @@ class MultiClassXGBoost:
         joblib.dump({'model': self.model, 'params': self.best_params if self.best_params else self.params}, filepath)
         print(f"\n💾 Model saved: {filename}")
 
+
 class MultiClassNeuralNet(nn.Module):
     """Neural network for multi-class classification"""
 
@@ -362,7 +360,7 @@ class MultiClassNeuralNetModel:
         print(f"\n✅ Training complete")
         print(f"   Best validation accuracy: {best_val_acc:.4f}")
         print(f"⏱️  Training time: {t_train:.2f}s")
-        print(f"⏱️  Total time: {total_time:.2f}s ({total_time/60:.1f} min)")
+        print(f"⏱️  Total time: {total_time:.2f}s ({total_time / 60:.1f} min)")
 
     def predict(self, X):
         """Predict class labels"""
@@ -389,7 +387,7 @@ class MultiClassNeuralNetModel:
         y_pred = self.predict(X_test)
         t_pred = time.time() - t_pred_start
         print(f"✓ Predictions complete ({t_pred:.2f}s)")
-        print(f"   Throughput: {len(X_test)/t_pred:.0f} samples/sec")
+        print(f"   Throughput: {len(X_test) / t_pred:.0f} samples/sec")
 
         target_names = label_encoder.classes_ if label_encoder else [f'Class_{i}' for i in range(self.num_classes)]
 
@@ -448,7 +446,8 @@ class MultiClassNeuralNetModel:
 
 if __name__ == "__main__":
     Config.set_seeds()
-
+    Config.print_mode_info()
+    
     print("=" * 70)
     print("🎯 MULTI-CLASS CLASSIFICATION: ATTACK TYPE DETECTION")
     print("=" * 70)
@@ -501,5 +500,5 @@ if __name__ == "__main__":
     print(f"\n📊 Model Comparison:")
     print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
     print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
-    print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time/60:.1f} min)")
+    print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")

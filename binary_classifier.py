@@ -256,11 +256,16 @@ def train_and_evaluate_baseline(X_train, y_train, X_test, y_test):
 
 if __name__ == "__main__":
     Config.set_seeds()
-    print("=" * 70); print("🎯 BINARY CLASSIFICATION: BENIGN VS MALICIOUS"); print("=" * 70)
+    Config.print_mode_info()
+    
+    print("=" * 70);
+    print("🎯 BINARY CLASSIFICATION: BENIGN VS MALICIOUS");
+    print("=" * 70)
     overall_start = time.time()
 
     X_train, X_test, y_train, y_test = get_data_for_binary()
-    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=Config.RANDOM_STATE, stratify=y_train)
+    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=Config.RANDOM_STATE,
+                                                stratify=y_train)
 
     # --- 1. Train Advanced, Tuned LightGBM Model ---
     lgbm_classifier = BinaryClassifier()
@@ -270,15 +275,22 @@ if __name__ == "__main__":
 
     # --- 2. Train LightGBM Logistic Regression Baseline ---
     if Config.RUN_LOGISTIC_REGRESSION:
-        print("\n" + "=" * 70); print("🚀 TRAINING BASELINE: LightGBM (Logistic Config)"); print("=" * 70)
-        lr_params = {'objective': 'binary', 'boosting_type': 'gbdt', 'num_leaves': 2, 'max_depth': 1, 'n_estimators': 200, 'learning_rate': 0.1, 'n_jobs': Config.N_JOBS, 'random_state': Config.RANDOM_STATE, 'verbose': -1}
+        print("\n" + "=" * 70);
+        print("🚀 TRAINING BASELINE: LightGBM (Logistic Config)");
+        print("=" * 70)
+        lr_params = {'objective': 'binary', 'boosting_type': 'gbdt', 'num_leaves': 2, 'max_depth': 1,
+                     'n_estimators': 200, 'learning_rate': 0.1, 'n_jobs': Config.N_JOBS,
+                     'random_state': Config.RANDOM_STATE, 'verbose': -1}
         lr_classifier = BinaryClassifier(params=lr_params)
-        lr_classifier.train(X_train, y_train, use_smote=False, use_optuna=False) # Train baseline on original data without tuning
-        lr_results = lr_classifier.evaluate(X_test, y_test, save_plots=False) # Don't overwrite plots
+        lr_classifier.train(X_train, y_train, use_smote=False,
+                            use_optuna=False)  # Train baseline on original data without tuning
+        lr_results = lr_classifier.evaluate(X_test, y_test, save_plots=False)  # Don't overwrite plots
         lr_classifier.save_model('binary_classifier_logistic.pkl')
 
     # --- 3. Final Summary ---
-    print("\n" + "=" * 70); print("🎉 FINAL RESULTS SUMMARY"); print("=" * 70)
+    print("\n" + "=" * 70);
+    print("🎉 FINAL RESULTS SUMMARY");
+    print("=" * 70)
     print(f"⏱️  Total pipeline time: {time.time() - overall_start:.2f}s")
     print(f"\n🎯 Model Comparison (ROC-AUC):")
     if Config.RUN_LOGISTIC_REGRESSION:

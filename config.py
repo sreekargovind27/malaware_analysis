@@ -8,14 +8,22 @@ import torch
 
 
 class Config:
+    # ==================== MODE SETTINGS ====================
+    # Set to True for testing with smaller dataset, False for production
+    TEST_MODE = True  # <-- TOGGLE THIS
+
     # ==================== PATHS ====================
-    RAW_DIR_ORIGINAL = 'data/raw/'
+    # Dynamically choose raw directory based on test mode
+    RAW_DIR_ORIGINAL = 'data/raw_test/' if TEST_MODE else 'data/raw/'
+
     ENGINEERED_SPLIT_DIR = 'data/engineered_split_csv/'
     ENGINEERED_DIR = 'data/engineered_features/'
     MODELS_DIR = 'models/'
     RESULTS_DIR = 'results/'
+
     for dir_path in [RAW_DIR_ORIGINAL, ENGINEERED_SPLIT_DIR, ENGINEERED_DIR, MODELS_DIR, RESULTS_DIR]:
         os.makedirs(dir_path, exist_ok=True)
+
     ENGINEERED_DATA_PATH = os.path.join(ENGINEERED_DIR, 'final_features.parquet')
     ENGINEERED_DATA_PATH_CSV = os.path.join(ENGINEERED_DIR, 'final_features.csv')
     FEATURE_LIST_PATH = os.path.join(ENGINEERED_DIR, 'final_feature_list.joblib')
@@ -37,8 +45,8 @@ class Config:
     }
 
     # ==================== DATA SETTINGS ====================
-    SAMPLE_SIZE = None;
-    TEST_SIZE = 0.2;
+    SAMPLE_SIZE = None
+    TEST_SIZE = 0.2
     RANDOM_STATE = 42
 
     # ==================== FEATURES ====================
@@ -56,21 +64,22 @@ class Config:
         'packet_rate', 'is_scanning_signature', 'suspicious_score'
     ]
 
-    TARGET_COL = 'label';
-    DETAILED_TARGET_COL = 'attack_type';
+    TARGET_COL = 'label'
+    DETAILED_TARGET_COL = 'attack_type'
     FAMILY_TARGET_COL = 'malware_family'
 
     @staticmethod
     def get_feature_list():
-        if os.path.exists(Config.FEATURE_LIST_PATH): return joblib.load(Config.FEATURE_LIST_PATH)
-        print(f"Warning: Feature list not found. Run build_dataset.py.");
+        if os.path.exists(Config.FEATURE_LIST_PATH):
+            return joblib.load(Config.FEATURE_LIST_PATH)
+        print(f"Warning: Feature list not found. Run build_dataset.py.")
         return []
 
     # ==================== IMBALANCE & OPTIMIZATION ====================
-    USE_SMOTE = True;
+    USE_SMOTE = True
     SMOTE_SAMPLE_THRESHOLD = 100000
-    USE_OPTUNA = True;
-    OPTUNA_N_TRIALS = 20;
+    USE_OPTUNA = True
+    OPTUNA_N_TRIALS = 20
     OPTUNA_TIMEOUT = 1800  # 30 min
     RUN_LOGISTIC_REGRESSION = True  # Toggle for the baseline model in binary_classifier.py
 
@@ -82,29 +91,43 @@ class Config:
     else:
         DEVICE = 'cpu'
 
-    AUTOENCODER_LATENT_DIM = 8;
-    AUTOENCODER_EPOCHS = 100;
-    AUTOENCODER_BATCH_SIZE = 4096;
-    AUTOENCODER_LR = 0.0001;
+    AUTOENCODER_LATENT_DIM = 8
+    AUTOENCODER_EPOCHS = 100
+    AUTOENCODER_BATCH_SIZE = 4096
+    AUTOENCODER_LR = 0.0001
     ANOMALY_THRESHOLD_PERCENTILE = 99
-    BINARY_N_ESTIMATORS = 200;
-    BINARY_LEARNING_RATE = 0.1;
+    BINARY_N_ESTIMATORS = 200
+    BINARY_LEARNING_RATE = 0.1
     BINARY_NUM_LEAVES = 50
-    MULTICLASS_N_ESTIMATORS = 200;
-    MULTICLASS_LEARNING_RATE = 0.1;
+    MULTICLASS_N_ESTIMATORS = 200
+    MULTICLASS_LEARNING_RATE = 0.1
     MULTICLASS_MAX_DEPTH = 10
-    KMEANS_N_CLUSTERS = 5;
+    KMEANS_N_CLUSTERS = 5
     KMEANS_BATCH_SIZE = 10000
-    NUM_WORKERS = 0 if os.name == 'nt' else 4;
-    PIN_MEMORY = True;
+    NUM_WORKERS = 0 if os.name == 'nt' else 4
+    PIN_MEMORY = True
     N_JOBS = -1
 
     # ==================== REPRODUCIBILITY ====================
     @staticmethod
     def set_seeds():
-        import random;
+        import random
         import numpy as np
-        random.seed(Config.RANDOM_STATE);
-        np.random.seed(Config.RANDOM_STATE);
+        random.seed(Config.RANDOM_STATE)
+        np.random.seed(Config.RANDOM_STATE)
         torch.manual_seed(Config.RANDOM_STATE)
-        if torch.cuda.is_available(): torch.cuda.manual_seed_all(Config.RANDOM_STATE)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(Config.RANDOM_STATE)
+
+    # ==================== DISPLAY MODE INFO ====================
+    @staticmethod
+    def print_mode_info():
+        """Print current configuration mode"""
+        print("\n" + "=" * 70)
+        print("⚙️  CONFIGURATION MODE")
+        print("=" * 70)
+        mode = "TEST MODE 🧪" if Config.TEST_MODE else "PRODUCTION MODE 🚀"
+        print(f"   Mode: {mode}")
+        print(f"   Raw Data Directory: {Config.RAW_DIR_ORIGINAL}")
+        print(f"   Device: {Config.DEVICE}")
+        print("=" * 70)

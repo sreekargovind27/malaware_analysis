@@ -1,7 +1,7 @@
 """
 Autoencoder for Anomaly Detection
 Trains on benign data only, detects anomalies by reconstruction error.
-UPDATED: Enhanced timing display and progress tracking.
+UPDATED: Added Optuna hyperparameter tuning + enhanced timing display.
 """
 
 import os
@@ -10,42 +10,49 @@ import time
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
+import optuna
 import torch
 import torch.nn as nn
+from optuna.samplers import TPESampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import Config
 from data_loader import get_data_for_autoencoder, load_engineered_data, IoTDataset
-from torch.utils.data import DataLoader
 
 
 class Autoencoder(nn.Module):
-    """Simple and stable Autoencoder architecture"""
+    """Flexible Autoencoder architecture with configurable layers"""
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, latent_dim=8, hidden_layers=None, dropout_rate=0.0):
         super(Autoencoder, self).__init__()
 
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, Config.AUTOENCODER_LATENT_DIM)
-        )
+        if hidden_layers is None:
+            hidden_layers = [64, 32, 16]
 
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(Config.AUTOENCODER_LATENT_DIM, 16),
-            nn.ReLU(),
-            nn.Linear(16, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Linear(64, input_dim)
-        )
+        # Build encoder
+        encoder_layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_layers:
+            encoder_layers.append(nn.Linear(prev_dim, hidden_dim))
+            encoder_layers.append(nn.ReLU())
+            if dropout_rate > 0:
+                encoder_layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Build decoder (mirror of encoder)
+        decoder_layers = []
+        prev_dim = latent_dim
+        for hidden_dim in reversed(hidden_layers):
+            decoder_layers.append(nn.Linear(prev_dim, hidden_dim))
+            decoder_layers.append(nn.ReLU())
+            if dropout_rate > 0:
+                decoder_layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        decoder_layers.append(nn.Linear(prev_dim, input_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
         encoded = self.encoder(x)
@@ -57,30 +64,186 @@ class Autoencoder(nn.Module):
 
 
 class AutoencoderModel:
-    """Wrapper class for training and inference"""
+    """Wrapper class for training and inference with Optuna support"""
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, latent_dim=None, hidden_layers=None, dropout_rate=None, learning_rate=None):
         self.device = Config.DEVICE
-        self.model = Autoencoder(input_dim).to(self.device)
+        self.input_dim = input_dim
+
+        # Use provided params or defaults from Config
+        self.latent_dim = latent_dim or Config.AUTOENCODER_LATENT_DIM
+        self.hidden_layers = hidden_layers or [64, 32, 16]
+        self.dropout_rate = dropout_rate or 0.0
+        self.learning_rate = learning_rate or Config.AUTOENCODER_LR
+
+        self.model = Autoencoder(
+            input_dim,
+            self.latent_dim,
+            self.hidden_layers,
+            self.dropout_rate
+        ).to(self.device)
+
         self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=Config.AUTOENCODER_LR)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.threshold = None
         self.scaler = None
+        self.best_params = None
+
         print(f"Autoencoder initialized on {self.device}")
         print(f"  Input dim: {input_dim}")
-        print(f"  Latent dim: {Config.AUTOENCODER_LATENT_DIM}")
-        print(
-            f"  Architecture: {input_dim} → 64 → 32 → 16 → {Config.AUTOENCODER_LATENT_DIM} → 16 → 32 → 64 → {input_dim}")
+        print(f"  Latent dim: {self.latent_dim}")
+        print(f"  Hidden layers: {self.hidden_layers}")
+        print(f"  Dropout rate: {self.dropout_rate}")
+        print(f"  Learning rate: {self.learning_rate}")
 
-    def train(self, train_loader, val_loader, scaler):
+    def optimize_hyperparameters(self, train_loader, val_loader, scaler):
+        """Use Optuna to find best hyperparameters"""
+        print("\n" + "=" * 70)
+        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Autoencoder)")
+        print("=" * 70)
+
+        t_start = time.time()
+
+        if not Config.USE_OPTUNA:
+            print("\n⭐️  Optuna disabled in config, using default parameters")
+            return {
+                'latent_dim': Config.AUTOENCODER_LATENT_DIM,
+                'hidden_layer_1': 64,
+                'hidden_layer_2': 32,
+                'hidden_layer_3': 16,
+                'dropout_rate': 0.0,
+                'learning_rate': Config.AUTOENCODER_LR,
+                'batch_size': Config.AUTOENCODER_BATCH_SIZE
+            }
+
+        print(f"\n⏳ Running Optuna optimization...")
+        print(f"   Trials: {Config.OPTUNA_N_TRIALS}")
+        print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
+
+        def objective(trial):
+            # Suggest hyperparameters
+            latent_dim = trial.suggest_int('latent_dim', 4, 32)
+            hidden_layer_1 = trial.suggest_int('hidden_layer_1', 32, 128)
+            hidden_layer_2 = trial.suggest_int('hidden_layer_2', 16, 64)
+            hidden_layer_3 = trial.suggest_int('hidden_layer_3', 8, 32)
+            dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
+            learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+
+            # Create model with suggested parameters
+            hidden_layers = [hidden_layer_1, hidden_layer_2, hidden_layer_3]
+            temp_model = Autoencoder(
+                self.input_dim,
+                latent_dim,
+                hidden_layers,
+                dropout_rate
+            ).to(self.device)
+
+            temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
+            temp_criterion = nn.MSELoss()
+
+            # Train for a few epochs
+            num_epochs = min(20, Config.AUTOENCODER_EPOCHS)
+            best_val_loss = float('inf')
+
+            for epoch in range(num_epochs):
+                # Training
+                temp_model.train()
+                train_loss = 0
+                for batch in train_loader:
+                    batch = batch.to(self.device)
+                    temp_optimizer.zero_grad()
+                    reconstructed = temp_model(batch)
+                    loss = temp_criterion(reconstructed, batch)
+
+                    if torch.isnan(loss):
+                        return float('inf')
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(temp_model.parameters(), max_norm=1.0)
+                    temp_optimizer.step()
+                    train_loss += loss.item()
+
+                # Validation
+                temp_model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        batch = batch.to(self.device)
+                        reconstructed = temp_model(batch)
+                        loss = temp_criterion(reconstructed, batch)
+                        val_loss += loss.item()
+
+                val_loss /= len(val_loader) if len(val_loader) > 0 else 1
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+
+                # Early stopping for optimization
+                if epoch > 5 and val_loss > best_val_loss * 1.5:
+                    break
+
+            return best_val_loss
+
+        sampler = TPESampler(seed=Config.RANDOM_STATE)
+        study = optuna.create_study(direction='minimize', sampler=sampler)
+        study.optimize(
+            objective,
+            n_trials=Config.OPTUNA_N_TRIALS,
+            timeout=Config.OPTUNA_TIMEOUT,
+            show_progress_bar=True
+        )
+
+        t_elapsed = time.time() - t_start
+
+        print(f"\n✅ Optimization complete")
+        print(f"⏱️  Time: {t_elapsed:.2f}s ({t_elapsed / 60:.1f} min)")
+        print(f"\n📊 Best trial:")
+        print(f"   Validation Loss: {study.best_value:.6f}")
+        print(f"   Parameters:")
+        for key, value in study.best_params.items():
+            print(f"      {key}: {value}")
+
+        self.best_params = study.best_params
+        return study.best_params
+
+    def train(self, train_loader, val_loader, scaler, use_optuna=True):
         """Train autoencoder on benign data"""
         print("\n" + "=" * 70)
         print("🚀 TRAINING AUTOENCODER")
         print("=" * 70)
 
         overall_start = time.time()
-
         self.scaler = scaler
+
+        # Hyperparameter optimization
+        if use_optuna and Config.USE_OPTUNA:
+            best_params = self.optimize_hyperparameters(train_loader, val_loader, scaler)
+
+            # Rebuild model with best parameters
+            self.latent_dim = best_params['latent_dim']
+            self.hidden_layers = [
+                best_params['hidden_layer_1'],
+                best_params['hidden_layer_2'],
+                best_params['hidden_layer_3']
+            ]
+            self.dropout_rate = best_params['dropout_rate']
+            self.learning_rate = best_params['learning_rate']
+
+            print("\n" + "=" * 70)
+            print("🎯 TRAINING FINAL MODEL WITH OPTIMIZED PARAMETERS")
+            print("=" * 70)
+
+            self.model = Autoencoder(
+                self.input_dim,
+                self.latent_dim,
+                self.hidden_layers,
+                self.dropout_rate
+            ).to(self.device)
+
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        else:
+            print("\n⭐️  Using default parameters (no optimization)")
+
         best_val_loss = float('inf')
         patience = 10
         patience_counter = 0
@@ -89,7 +252,10 @@ class AutoencoderModel:
         print(f"\n📊 Training configuration:")
         print(f"   Epochs: {Config.AUTOENCODER_EPOCHS}")
         print(f"   Batch size: {Config.AUTOENCODER_BATCH_SIZE}")
-        print(f"   Learning rate: {Config.AUTOENCODER_LR}")
+        print(f"   Learning rate: {self.learning_rate}")
+        print(f"   Latent dim: {self.latent_dim}")
+        print(f"   Hidden layers: {self.hidden_layers}")
+        print(f"   Dropout: {self.dropout_rate}")
         print(f"   Early stopping patience: {patience}")
         print(f"   Device: {self.device}")
 
@@ -279,7 +445,12 @@ class AutoencoderModel:
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'threshold': self.threshold,
-            'scaler': self.scaler
+            'scaler': self.scaler,
+            'latent_dim': self.latent_dim,
+            'hidden_layers': self.hidden_layers,
+            'dropout_rate': self.dropout_rate,
+            'learning_rate': self.learning_rate,
+            'best_params': self.best_params
         }, filepath)
 
     def load_model(self, filename):
@@ -295,9 +466,11 @@ class AutoencoderModel:
             self.optimizer.load_state_dict(checkpoint['optimizer_state'])
         self.threshold = checkpoint.get('threshold')
         self.scaler = checkpoint.get('scaler')
+        self.best_params = checkpoint.get('best_params')
 
 
 if __name__ == "__main__":
+    Config.print_mode_info()
     Config.set_seeds()
 
     print("=" * 70)
@@ -314,9 +487,9 @@ if __name__ == "__main__":
     else:
         input_dim = len(final_feature_list)
 
-        # Train
+        # Train with Optuna optimization
         autoencoder = AutoencoderModel(input_dim)
-        autoencoder.train(train_loader, val_loader, scaler)
+        autoencoder.train(train_loader, val_loader, scaler, use_optuna=True)
 
         # Evaluate on validation
         if len(val_loader.dataset) > 0:
@@ -362,11 +535,9 @@ if __name__ == "__main__":
         # Scale using training scaler
         X_malicious_scaled = autoencoder.scaler.transform(X_malicious.values)
 
-        # ===== THIS IS THE ONLY FIX =====
-        # Use our custom IoTDataset to ensure the DataLoader yields a tensor directly, not a list
+        # Use our custom IoTDataset to ensure the DataLoader yields a tensor directly
         malicious_dataset = IoTDataset(X_malicious_scaled)
         malicious_loader = DataLoader(malicious_dataset, batch_size=4096, shuffle=False)
-        # ================================
 
         # Detect anomalies
         mal_predictions, mal_errors = autoencoder.detect_anomalies(malicious_loader)
