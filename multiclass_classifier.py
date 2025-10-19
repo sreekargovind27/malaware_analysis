@@ -333,6 +333,8 @@ class MultiClassNeuralNetModel:
         print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Neural Network)")
         print("=" * 70)
 
+        t_start = time.time()  # Define t_start at the beginning of the method.
+
         if not Config.USE_OPTUNA:
             print("\n⏭️  Optuna disabled in config, using default parameters")
             return {
@@ -375,11 +377,15 @@ class MultiClassNeuralNetModel:
 
             print("  [1/8] Suggesting parameters...")
             n_layers = trial.suggest_int('n_layers', 2, 4)
-            hidden_layers = [trial.suggest_int(f'layer_{i+1}', 32, 256) for i in range(n_layers)]
+            hidden_layers = []
+            for i in range(n_layers):
+                layer_size = trial.suggest_categorical(f'layer_{i+1}', [32, 64, 128, 256])
+                hidden_layers.append(layer_size)
+
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-            batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048, 4096])
+            batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384, 32768, 65536])
             print("  [2/8] ✓ Parameters suggested.")
             print(f"      - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
 
