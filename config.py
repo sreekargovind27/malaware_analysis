@@ -104,7 +104,8 @@ class Config:
     MULTICLASS_MAX_DEPTH = 10
     KMEANS_N_CLUSTERS = 5
     KMEANS_BATCH_SIZE = 10000
-    NUM_WORKERS = 0 if os.name == 'nt' else 16
+    # NUM_WORKERS = 0 if os.name == 'nt' else 16
+    NUM_WORKERS = 0
     PIN_MEMORY = True
     N_JOBS = 32
 
