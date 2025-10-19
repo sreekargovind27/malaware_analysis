@@ -159,7 +159,7 @@ def get_data_for_multiclass():
 
     print("\n🎯 Performing class-aware undersampling on the TRAINING set...")
 
-    NEW_TARGET_TRAIN_SIZE = int(len(train_df) * 0.30)
+    NEW_TARGET_TRAIN_SIZE = int(len(train_df) * 0.04)
     MINORITY_CLASS_THRESHOLD = 100000
 
     print(f"   Original train size: {len(train_df):,} rows")
