@@ -1,13 +1,14 @@
 #!/bin/bash
 
-# IoT-23 Dataset Downloader & CSV Converter
+# IoT-23 Dataset Downloader & CSV Converter with Progress Bars
 # - Outputs flat CSV files into data/raw/
+# - Shows download progress for each file
 # - Filename = scenario name (e.g., CTU-IoT-Malware-Capture-34-1.csv)
 # - Includes Source_Folder column and trims whitespace
 
 # --- Configuration ---
 BASE_URL="https://mcfp.felk.cvut.cz/publicDatasets/IoT-23-Dataset/IndividualScenarios"
-OUTPUT_DIR="data/raw"  # <-- Changed to your desired path
+OUTPUT_DIR="data/raw"
 MAX_JOBS=4
 
 # Exact list of 20 scenarios
@@ -50,30 +51,52 @@ process_scenario() {
     local LOG_URL="$BASE_URL/$SCENARIO/bro/conn.log.labeled"
     local TEMP_LOG="$OUTPUT_DIR/${SCENARIO}.tmp"
 
-    echo "[START] $SCENARIO: downloading..."
-    if wget -q --timeout=60 --tries=3 -O "$TEMP_LOG" "$LOG_URL"; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "[START] $SCENARIO"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Download with progress bar
+    if wget --progress=bar:force:noscroll \
+            -c \
+            --timeout=120 \
+            --tries=5 \
+            -O "$TEMP_LOG" \
+            "$LOG_URL" 2>&1 | \
+            grep --line-buffered -E '^[0-9]+%|saved'; then
+
         if [[ ! -s "$TEMP_LOG" ]]; then
             echo "[ERROR] $SCENARIO: downloaded file is empty."
             rm -f "$TEMP_LOG"
             return 1
         fi
 
-        echo "[CONVERT] $SCENARIO: adding Source_Folder and trimming whitespace..."
+        echo "[CONVERT] $SCENARIO: processing to CSV..."
 
-        # Full header with Source_Folder
+        # Use awk for much faster processing (single pass)
         HEADER="Source_Folder,ts,uid,id.orig_h,id.orig_p,id.resp_h,id.resp_p,proto,service,duration,orig_bytes,resp_bytes,conn_state,local_orig,local_resp,missed_bytes,history,orig_pkts,orig_ip_bytes,resp_pkts,resp_ip_bytes,label,detailed-label"
-        echo "$HEADER" > "$CSV_PATH"
 
-        # Process non-comment lines: prepend scenario, trim trailing space, convert tabs to commas
-        grep -v '^#' "$TEMP_LOG" | while IFS= read -r line; do
-            echo "$SCENARIO,$line" | sed 's/[[:space:]]*$//' | tr '\t' ','
-        done >> "$CSV_PATH"
+        awk -v scenario="$SCENARIO" -v header="$HEADER" '
+            BEGIN {
+                print header
+                OFS = ","
+            }
+            /^#/ { next }
+            {
+                sub(/[[:space:]]+$/, "")  # trim trailing whitespace
+                gsub(/\t/, ",")            # tabs to commas
+                print scenario "," $0
+            }
+        ' "$TEMP_LOG" > "$CSV_PATH"
 
         rm -f "$TEMP_LOG"
-        echo "[DONE] $SCENARIO"
+
+        local FILE_SIZE=$(du -h "$CSV_PATH" | cut -f1)
+        echo "✅ [DONE] $SCENARIO (${FILE_SIZE})"
+        echo ""
     else
         echo "[ERROR] $SCENARIO: download failed."
         rm -f "$TEMP_LOG"
+        echo ""
     fi
 }
 
@@ -84,7 +107,10 @@ export BASE_URL OUTPUT_DIR
 # Ensure output directory exists
 mkdir -p "$OUTPUT_DIR"
 
-echo "=== Starting IoT-23 CSV Conversion (output: $OUTPUT_DIR) ==="
+echo "╔════════════════════════════════════════════════════╗"
+echo "║  IoT-23 CSV Conversion (output: $OUTPUT_DIR)    ║"
+echo "╚════════════════════════════════════════════════════╝"
+echo ""
 
 if command -v parallel >/dev/null 2>&1; then
     printf '%s\n' "${SCENARIOS[@]}" | parallel -j "$MAX_JOBS" --line-buffer process_scenario {} "$BASE_URL" "$OUTPUT_DIR"
@@ -102,8 +128,11 @@ else
 fi
 
 echo ""
-echo "✅ All scenarios processed!"
-echo "📁 CSV files saved in: $OUTPUT_DIR/"
+echo "╔════════════════════════════════════════════════════╗"
+echo "║  ✅ All scenarios processed!                       ║"
+echo "║  📁 CSV files saved in: $OUTPUT_DIR/              ║"
+echo "╚════════════════════════════════════════════════════╝"
+echo ""
 
 # --- OPTIONAL: Merge all CSVs ---
 read -p "Do you want to merge all CSVs into a single file? (y/N): " -n 1 -r
