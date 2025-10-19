@@ -216,6 +216,12 @@ def _preprocess_partition(df, all_categorical_values):
     to_drop = [col for col in METADATA_COLUMNS if col in df.columns and col not in ip_columns_to_keep]
     df = df.drop(columns=to_drop, errors='ignore')
 
+    # Convert local_orig and local_resp to int
+    if 'local_orig' in df.columns:
+        df['local_orig'] = pd.to_numeric(df['local_orig'], errors='coerce').fillna(0).astype(np.int8)
+    if 'local_resp' in df.columns:
+        df['local_resp'] = pd.to_numeric(df['local_resp'], errors='coerce').fillna(0).astype(np.int8)
+
     # ==================== 2. BASE NUMERICAL FEATURES ====================
     for col in Config.BASE_NUMERICAL_FEATURES:
         if col not in df.columns:
@@ -407,9 +413,9 @@ def build_engineered_dataset():
     print(f"   📊 Total rows: {total_rows:,}")
     print("=" * 70)
 
-    # ==================== STAGE 2: COMBINE FILES (MEMORY-SAFE) ====================
+    # ==================== STAGE 2: STRATIFIED SAMPLING (ALL FILES) ====================
     print("\n" + "=" * 70)
-    print("🔍 STAGE 2: COMBINING FILES (PANDAS)")
+    print("🔍 STAGE 2: COMBINING WITH STRATIFIED SAMPLING")
     print("=" * 70)
 
     stage2_start = time.time()
@@ -420,23 +426,49 @@ def build_engineered_dataset():
         return
 
     print(f"📁 Found {len(split_files)} files")
-    print(f"⏳ Loading first 10 files (memory-safe)...")
 
-    final_chunks = []
-    for pq_file in split_files[:10]:
-        print(f"  Loading {os.path.basename(pq_file)}...")
+    # Calculate total rows across all files
+    print(f"⏳ Counting total rows...")
+    file_row_counts = {}
+    total_rows = 0
+    for pq_file in split_files:
+        df_temp = pd.read_parquet(pq_file, columns=['label'])  # Only read 1 column for speed
+        file_row_counts[pq_file] = len(df_temp)
+        total_rows += len(df_temp)
+        del df_temp
+
+    print(f"✓ Total rows across all files: {total_rows:,}")
+
+    target_rows = Config.SAMPLE_SIZE if Config.SAMPLE_SIZE else total_rows
+    sample_frac = min(1.0, target_rows / total_rows)
+
+    print(f"⏳ Sampling {sample_frac:.1%} from each file (target: {target_rows:,} rows)...")
+
+    all_samples = []
+    for pq_file in split_files:
+        print(f"  Sampling {os.path.basename(pq_file)}...")
         df_chunk = pd.read_parquet(pq_file)
-        final_chunks.append(df_chunk)
 
-    print(f"⏳ Concatenating...")
-    final_df = pd.concat(final_chunks, ignore_index=True)
-    print(f"✓ Combined {len(final_df):,} rows")
+        # Sample proportionally from this file
+        n_sample = int(len(df_chunk) * sample_frac)
+        if n_sample < len(df_chunk):
+            df_chunk = df_chunk.sample(n=n_sample, random_state=Config.RANDOM_STATE)
 
-    # Sample if needed
-    if Config.SAMPLE_SIZE and len(final_df) > Config.SAMPLE_SIZE:
-        print(f"⏳ Sampling {Config.SAMPLE_SIZE:,} rows...")
-        final_df = final_df.sample(n=Config.SAMPLE_SIZE, random_state=Config.RANDOM_STATE)
-        print(f"✓ Sampled to {len(final_df):,} rows")
+        all_samples.append(df_chunk)
+        del df_chunk
+        print(f"    Sampled {len(all_samples[-1]):,} rows")
+
+    print(f"⏳ Concatenating all samples...")
+    final_df = pd.concat(all_samples, ignore_index=True)
+    del all_samples
+
+    print(f"✓ Final dataset: {len(final_df):,} rows from {len(split_files)} files")
+
+    print("\n⏳ Fixing column types...")
+    for col in final_df.columns:
+        if final_df[col].dtype == 'object':
+            # Force convert to string (safest option)
+            final_df[col] = final_df[col].astype(str)
 
     print("\n⏳ Saving Parquet...")
     final_df.to_parquet(Config.ENGINEERED_DATA_PATH, compression='snappy', index=False)
@@ -448,11 +480,9 @@ def build_engineered_dataset():
     print("✓ CSV saved")
 
     # Save feature list
-    final_feature_list = [col for col in final_df.columns if
-                          col not in [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL,
-                                      'attack_subtype']]
+    final_feature_list = [col for col in final_df.columns if col not in
+                          [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL, 'attack_subtype']]
     joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
-    print(f"✓ Feature list saved ({len(final_feature_list)} features)")
 
     stage2_time = time.time() - stage2_start
     total_time = time.time() - overall_start
