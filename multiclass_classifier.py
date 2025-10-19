@@ -21,15 +21,11 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader  # Use TensorDataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import Config
 from data_loader import get_data_for_multiclass, IoTDataset
-
-
-# NOTE: IoTDataset is no longer needed from data_loader for this script
-#       but keeping the import in case other parts of your project use it.
 
 
 class MultiClassXGBoost:
@@ -286,46 +282,82 @@ class MultiClassNeuralNet(nn.Module):
         return self.network(x)
 
 
+# ============================================================================
+# ============================================================================
+# === THIS IS THE CORRECTED, ROBUST NEURAL NETWORK CLASS =====================
+# ============================================================================
+# ============================================================================
 class MultiClassNeuralNetModel:
     """Neural network model wrapper with Optuna support"""
 
-    def __init__(self, input_dim, num_classes, hidden_layers=None, dropout_rate=None,
-                 learning_rate=None, use_batch_norm=True):
+    def __init__(self, input_dim, num_classes):
         self.device = Config.DEVICE
         self.input_dim = input_dim
         self.num_classes = num_classes
 
-        self.hidden_layers = hidden_layers or [128, 64, 32]
-        self.dropout_rate = dropout_rate if dropout_rate is not None else 0.3
-        self.learning_rate = learning_rate or 0.001
-        self.use_batch_norm = use_batch_norm
-
-        self.model = MultiClassNeuralNet(
-            input_dim, num_classes, self.hidden_layers,
-            self.dropout_rate, self.use_batch_norm
-        ).to(self.device)
-
-        if self.device != 'cpu':
-            print("⏳ Warming up CUDA context...")
-            try:
-                dummy_input = torch.randn(2, input_dim, device=self.device)
-                _ = self.model(dummy_input)
-                torch.cuda.synchronize()
-                print("✓ CUDA warmup complete.")
-            except Exception as e:
-                print(f"⚠️ CUDA Warmup failed: {e}.")
-
+        # --- Default attributes before loading or training ---
+        self.hidden_layers = [128, 64, 32]  # Default architecture
+        self.dropout_rate = 0.3
+        self.learning_rate = 0.001
+        self.use_batch_norm = True
+        self.model = None  # Model will be built by .build_model()
+        self.optimizer = None
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.scaler = None
         self.best_params = None
 
         print(f"Multi-Class Neural Net initialized on {self.device}")
-        print(f"  Input dim: {input_dim}, Classes: {num_classes}")
-        print(f"  Hidden layers: {self.hidden_layers}")
-        print(f"  Dropout: {self.dropout_rate}")
-        print(f"  Learning rate: {self.learning_rate}")
-        print(f"  Batch normalization: {self.use_batch_norm}")
+
+    def build_model(self):
+        """Builds or rebuilds the neural network based on current attributes."""
+        print(f"\n🏗️  Building model with architecture: {self.hidden_layers}")
+        self.model = MultiClassNeuralNet(
+            self.input_dim, self.num_classes, self.hidden_layers,
+            self.dropout_rate, self.use_batch_norm
+        ).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+    def load_model(self, filename='multiclass_nn.pth'):
+        """Load model, correctly rebuilding the architecture from the file first."""
+        filepath = os.path.join(Config.MODELS_DIR, filename)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"❌ Model file {filepath} not found")
+
+        # Load the entire dictionary from the file
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+
+        # --- 1. Get architecture params FROM THE FILE ---
+        print("💾 Reading architecture from checkpoint...")
+        self.num_classes = checkpoint['num_classes']
+        self.hidden_layers = checkpoint['hidden_layers']
+        self.dropout_rate = checkpoint['dropout_rate']
+        self.use_batch_norm = checkpoint['use_batch_norm']
+        self.learning_rate = checkpoint['learning_rate']
+        self.best_params = checkpoint.get('best_params')
+        self.scaler = checkpoint['scaler']
+
+        # --- 2. Re-build the model with the CORRECT architecture from the file ---
+        self.build_model()
+
+        # --- 3. Now, load the weights into the correctly-sized model ---
+        self.model.load_state_dict(checkpoint['model_state'])
+        print("✅ Model state loaded successfully into matching architecture.")
+
+    def save_model(self, filename='multiclass_nn.pth'):
+        """Save model AND its architecture."""
+        filepath = os.path.join(Config.MODELS_DIR, filename)
+        if self.model is None:
+            raise RuntimeError("Model has not been built yet. Cannot save.")
+        torch.save({
+            'model_state': self.model.state_dict(),
+            'scaler': self.scaler,
+            'num_classes': self.num_classes,
+            'hidden_layers': self.hidden_layers,  # CRITICAL: Save the architecture
+            'dropout_rate': self.dropout_rate,
+            'learning_rate': self.learning_rate,
+            'use_batch_norm': self.use_batch_norm,
+            'best_params': self.best_params
+        }, filepath)
 
     def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
         """Use Optuna to find best hyperparameters for Neural Network"""
@@ -335,57 +367,41 @@ class MultiClassNeuralNetModel:
         t_start = time.time()
 
         if not Config.USE_OPTUNA:
-            return {
+            # If not using Optuna, set to default values
+            self.best_params = {
                 'n_layers': 3, 'layer_1': 128, 'layer_2': 64, 'layer_3': 32,
                 'dropout_rate': 0.3, 'learning_rate': 0.001, 'batch_size': 4096,
                 'use_batch_norm': True
             }
+            return self.best_params
 
         print(f"\n⏳ Running Optuna optimization...")
-        print(f"   Trials: {Config.OPTUNA_N_TRIALS}")
-        print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
-
-        print("   Scaling data for Optuna...")
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
-        print("   ✓ Data scaled.")
 
         def objective(trial):
-            print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
-
             n_layers = trial.suggest_int('n_layers', 2, 4)
-            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
+            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in
+                             range(n_layers)]
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
             batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384])
-
-            print(
-                f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
 
             temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
                                              use_batch_norm).to(self.device)
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.CrossEntropyLoss()
 
-            train_loader = DataLoader(
-                IoTDataset(X_train_scaled, y_train),
-                batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True
-            )
-            val_loader = DataLoader(
-                IoTDataset(X_val_scaled, y_val),
-                batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True
-            )
+            train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False)
 
-            num_epochs = 20
             best_val_acc = 0
-            patience_counter = 0
-
-            for epoch in range(num_epochs):
+            for epoch in range(20): # Train for a fixed number of epochs for speed
                 temp_model.train()
                 for X_batch, y_batch in train_loader:
-                    X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                     temp_optimizer.zero_grad()
                     outputs = temp_model(X_batch)
                     loss = temp_criterion(outputs, y_batch)
@@ -396,46 +412,18 @@ class MultiClassNeuralNetModel:
                 val_correct, val_total = 0, 0
                 with torch.no_grad():
                     for X_batch, y_batch in val_loader:
-                        X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                        X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                         outputs = temp_model(X_batch)
                         _, predicted = torch.max(outputs, 1)
                         val_total += y_batch.size(0)
                         val_correct += (predicted == y_batch).sum().item()
-
                 val_acc = val_correct / val_total
-
-                if (epoch + 1) % 5 == 0:  # Print every 5 epochs to reduce log spam
-                    print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
-
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= 5:
-                        print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
-                        break
-                trial.report(val_acc, epoch)
-                if trial.should_prune():
-                    print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
-                    raise optuna.TrialPruned()
-
-            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
             return best_val_acc
 
-        sampler = TPESampler(seed=Config.RANDOM_STATE)
-        study = optuna.create_study(direction='maximize', sampler=sampler, pruner=optuna.pruners.MedianPruner())
-        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT,
-                       show_progress_bar=True)
-        t_elapsed = time.time() - t_start
-
-        print(f"\n✅ Optimization complete")
-        print(f"⏱️  Time: {t_elapsed:.2f}s ({t_elapsed / 60:.1f} min)")
-        print(f"\n📊 Best trial:\n   Validation Accuracy: {study.best_value:.4f}")
-        print(f"   Parameters:")
-        for key, value in study.best_params.items():
-            print(f"      {key}: {value}")
-
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT)
         self.best_params = study.best_params
         return study.best_params
 
@@ -444,91 +432,53 @@ class MultiClassNeuralNetModel:
         print("\n" + "=" * 70)
         print("🚀 TRAINING NEURAL NETWORK MULTI-CLASS")
         print("=" * 70)
-        overall_start = time.time()
 
         if use_optuna and Config.USE_OPTUNA:
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
-
             n_layers = best_params['n_layers']
             self.hidden_layers = [best_params[f'layer_{i + 1}'] for i in range(n_layers)]
             self.dropout_rate = best_params['dropout_rate']
             self.learning_rate = best_params['learning_rate']
             self.use_batch_norm = best_params['use_batch_norm']
             batch_size = best_params['batch_size']
-
-            print("\n" + "=" * 70)
-            print("🎯 TRAINING FINAL MODEL WITH OPTIMIZED PARAMETERS")
-            print("=" * 70)
-
-            self.model = MultiClassNeuralNet(self.input_dim, self.num_classes, self.hidden_layers, self.dropout_rate,
-                                             self.use_batch_norm).to(self.device)
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         else:
             batch_size = 4096
-            print("\n⏭️  Using default parameters (no optimization)")
 
-        print(f"\n⚖️  Calculating class weights...")
+        self.build_model() # Build the model with the chosen architecture
+
         class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
         self.criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(self.device))
-        print(f"✓ Class weights calculated")
-
-        print(f"\n⏳ Scaling features...")
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_val_scaled = self.scaler.transform(X_val)
-        print(f"✓ Scaling complete.")
 
-        final_train_workers = 0 if os.name == 'nt' else 8
-        print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,}, Workers: {final_train_workers})...")
-        train_loader = DataLoader(
-            IoTDataset(X_train_scaled, y_train),
-            batch_size=batch_size, shuffle=True,
-            num_workers=final_train_workers, pin_memory=True
-        )
-        val_loader = DataLoader(
-            IoTDataset(X_val_scaled, y_val),
-            batch_size=batch_size, shuffle=False,
-            num_workers=final_train_workers, pin_memory=True
-        )
-        print(f"✓ DataLoaders created")
+        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False)
 
-        print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
-        t_train_start = time.time()
         best_val_acc = 0
         patience_counter = 0
         progress_bar = tqdm(range(50), desc="Training")
 
         for epoch in progress_bar:
             self.model.train()
-            total_train_loss = 0
             for X_batch, y_batch in train_loader:
-                X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                 self.optimizer.zero_grad()
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
                 loss.backward()
                 self.optimizer.step()
-                total_train_loss += loss.item()
-            avg_train_loss = total_train_loss / len(train_loader)
 
             self.model.eval()
-            val_correct, val_total, total_val_loss = 0, 0, 0
+            val_correct, val_total = 0, 0
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
-                    X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                     outputs = self.model(X_batch)
-                    loss = self.criterion(outputs, y_batch)
-                    total_val_loss += loss.item()
                     _, predicted = torch.max(outputs, 1)
                     val_total += y_batch.size(0)
                     val_correct += (predicted == y_batch).sum().item()
             val_acc = val_correct / val_total
-            avg_val_loss = total_val_loss / len(val_loader)
-
-            progress_bar.set_postfix({
-                'Train Loss': f'{avg_train_loss:.4f}', 'Val Loss': f'{avg_val_loss:.4f}',
-                'Val Acc': f'{val_acc:.4f}', 'Best Acc': f'{best_val_acc:.4f}'
-            })
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -539,18 +489,12 @@ class MultiClassNeuralNetModel:
                 if patience_counter >= 10:
                     print(f"\n  Early stopping at epoch {epoch + 1}")
                     break
-
         self.load_model('best_multiclass_nn.pth')
-        t_train = time.time() - t_train_start
-        total_time = time.time() - overall_start
-
-        print(f"\n✅ Training complete")
-        print(f"   Best validation accuracy: {best_val_acc:.4f}")
-        print(f"⏱️  Training time: {t_train:.2f}s")
-        print(f"⏱️  Total time: {total_time:.2f}s ({total_time / 60:.1f} min)")
 
     def predict(self, X):
         """Predict class labels"""
+        if self.scaler is None:
+            raise RuntimeError("Scaler has not been loaded. Please load a trained model first.")
         if hasattr(X, 'values'):
             X = X.values
         X_scaled = self.scaler.transform(X)
@@ -566,34 +510,13 @@ class MultiClassNeuralNetModel:
         print("\n" + "=" * 70)
         print("📊 EVALUATING NEURAL NETWORK MULTI-CLASS")
         print("=" * 70)
-
-        t_eval_start = time.time()
-
-        print(f"\n⏳ Generating predictions...")
-        t_pred_start = time.time()
         y_pred = self.predict(X_test)
-        t_pred = time.time() - t_pred_start
-        print(f"✓ Predictions complete ({t_pred:.2f}s)")
-        print(f"   Throughput: {len(X_test) / (t_pred if t_pred > 0 else 1):.0f} samples/sec")
-
         target_names = label_encoder.classes_ if label_encoder else [f'Class_{i}' for i in range(self.num_classes)]
-
-        print("\n" + "─" * 70)
-        print("CLASSIFICATION REPORT")
-        print("─" * 70)
         print(classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
-
         acc = accuracy_score(y_test, y_pred)
-        print(f"\n{'─' * 70}")
         print(f"OVERALL ACCURACY: {acc:.4f}")
-        print('─' * 70)
-
         cm = confusion_matrix(y_test, y_pred)
         self._plot_confusion_matrix(cm, target_names)
-
-        t_eval = time.time() - t_eval_start
-        print(f"\n⏱️  Total evaluation time: {t_eval:.2f}s")
-
         return {'accuracy': acc}
 
     def _plot_confusion_matrix(self, cm, target_names):
@@ -610,37 +533,6 @@ class MultiClassNeuralNetModel:
         plt.close()
         print("  ✓ Saved confusion matrix")
 
-    def save_model(self, filename='multiclass_nn.pth'):
-        """Save model"""
-        filepath = os.path.join(Config.MODELS_DIR, filename)
-        torch.save({
-            'model_state': self.model.state_dict(),
-            'scaler': self.scaler,
-            'num_classes': self.num_classes,
-            'hidden_layers': self.hidden_layers,
-            'dropout_rate': self.dropout_rate,
-            'learning_rate': self.learning_rate,
-            'use_batch_norm': self.use_batch_norm,
-            'best_params': self.best_params
-        }, filepath)
-
-    def load_model(self, filename='multiclass_nn.pth'):
-        """Load model"""
-        filepath = os.path.join(Config.MODELS_DIR, filename)
-        if not os.path.exists(filepath):
-            print(f"❌ Model file {filepath} not found")
-            return
-
-        # =================================================================
-        # ADD weights_only=False HERE
-        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        # =================================================================
-
-        self.model.load_state_dict(checkpoint['model_state'])
-        self.scaler = checkpoint['scaler']
-        self.num_classes = checkpoint['num_classes']
-        self.best_params = checkpoint.get('best_params')
-
 
 if __name__ == "__main__":
     Config.print_mode_info()
@@ -651,32 +543,18 @@ if __name__ == "__main__":
     print("=" * 70)
 
     overall_start = time.time()
-
-    # Load data
     X_train, X_test, y_train, y_test, label_encoder = get_data_for_multiclass()
 
-    # Create validation split
-    print("\n⏳ Creating validation split...")
+    # ============================================================================
+    # ADD THIS ONE LINE RIGHT HERE FOR A SUPER FAST TEST:
+    X_train, y_train = X_train[:5000], y_train[:5000]
+    # ============================================================================
+
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.2, random_state=Config.RANDOM_STATE, stratify=y_train
     )
-    print(f"✓ Split complete")
-    print(f"   Train: {len(X_tr):,}")
-    print(f"   Val:   {len(X_val):,}")
-    print(f"   Test:  {len(X_test):,}")
-
-    # Convert to numpy for processing
     X_tr_np = X_tr.values
     X_val_np = X_val.values
-
-    # Train XGBoost
-    # print("\n" + "=" * 70)
-    # print("MODEL 1: XGBoost")
-    # print("=" * 70)
-    # xgb_model = MultiClassXGBoost()
-    # xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
-    # xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
-    # xgb_model.save_model()
 
     # Train Neural Network with Optuna
     print("\n" + "=" * 70)
@@ -687,16 +565,10 @@ if __name__ == "__main__":
     nn_model = MultiClassNeuralNetModel(input_dim, num_classes)
     nn_model.train(X_tr_np, y_tr, X_val_np, y_val, use_optuna=True)
     nn_results = nn_model.evaluate(X_test.values, y_test, label_encoder)
+
+    # Save the final, official model
     nn_model.save_model('multiclass_nn.pth')
 
-    # Final summary
     total_time = time.time() - overall_start
-
-    print("\n" + "=" * 70)
-    print("🎉 MULTI-CLASS CLASSIFICATION COMPLETE")
-    print("=" * 70)
-    print(f"\n📊 Model Comparison:")
-    # print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
-    print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
     print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")
