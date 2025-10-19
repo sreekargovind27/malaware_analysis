@@ -1,21 +1,18 @@
 #!/bin/bash
 
-# IoT-23 Dataset Downloader & CSV Converter - OPTIMIZED VERSION
+# IoT-23 Dataset Downloader & CSV Converter - FULLY FIXED VERSION
+# - Handles all different directory structures
 # - Uses aria2c for faster multi-connection downloads
 # - Parallel processing with increased jobs
-# - Optimized awk processing
-# - Includes all 23 scenarios (20 malicious + 3 benign)
 
 # --- Configuration ---
 BASE_URL="https://mcfp.felk.cvut.cz/publicDatasets/IoT-23-Dataset/IndividualScenarios"
 OUTPUT_DIR="data/raw"
-MAX_JOBS=12  # Increased for better parallelism
+MAX_JOBS=12
 
-# All 23 scenarios (20 malicious + 3 benign)
-SCENARIOS=(
-    # Malicious scenarios
+# Standard malicious scenarios (use /bro/ path)
+STANDARD_SCENARIOS=(
     "CTU-IoT-Malware-Capture-34-1"
-    "CTU-IoT-Malware-Capture-43-1"
     "CTU-IoT-Malware-Capture-44-1"
     "CTU-IoT-Malware-Capture-49-1"
     "CTU-IoT-Malware-Capture-52-1"
@@ -34,14 +31,21 @@ SCENARIOS=(
     "CTU-IoT-Malware-Capture-9-1"
     "CTU-IoT-Malware-Capture-3-1"
     "CTU-IoT-Malware-Capture-1-1"
-    # Benign scenarios
-    "CTU-Honeypot-Capture-7-1"
-    "CTU-Honeypot-Capture-4-1"
-    "CTU-Honeypot-Capture-5-1"
 )
 
-# Function to process one scenario
-process_scenario() {
+# Special case: CTU-43-1 uses /labeled/ instead of /bro/
+LABELED_SCENARIOS=(
+    "CTU-IoT-Malware-Capture-43-1"
+)
+
+# Benign scenarios with their specific subdirectories
+declare -A BENIGN_SCENARIOS
+BENIGN_SCENARIOS["CTU-Honeypot-Capture-7-1"]="Somfy-01"
+BENIGN_SCENARIOS["CTU-Honeypot-Capture-4-1"]="philips-hue"
+BENIGN_SCENARIOS["CTU-Honeypot-Capture-5-1"]="amazon-echo"
+
+# Function to process standard malicious scenarios (/bro/ path)
+process_standard_scenario() {
     local SCENARIO="$1"
     local BASE_URL="$2"
     local OUTPUT_DIR="$3"
@@ -57,8 +61,67 @@ process_scenario() {
     local TEMP_LOG="$OUTPUT_DIR/${SCENARIO}.tmp"
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "[START] $SCENARIO"
+    echo "[START] $SCENARIO (standard path)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    download_and_process "$SCENARIO" "$LOG_URL" "$TEMP_LOG" "$CSV_PATH"
+}
+
+# Function to process labeled scenarios (/labeled/ path)
+process_labeled_scenario() {
+    local SCENARIO="$1"
+    local BASE_URL="$2"
+    local OUTPUT_DIR="$3"
+
+    local CSV_PATH="$OUTPUT_DIR/${SCENARIO}.csv"
+
+    if [[ -f "$CSV_PATH" ]]; then
+        echo "[SKIP] $SCENARIO"
+        return 0
+    fi
+
+    local LOG_URL="$BASE_URL/$SCENARIO/labeled/conn.log.labeled"
+    local TEMP_LOG="$OUTPUT_DIR/${SCENARIO}.tmp"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "[START] $SCENARIO (labeled path)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    download_and_process "$SCENARIO" "$LOG_URL" "$TEMP_LOG" "$CSV_PATH"
+}
+
+# Function to process benign scenarios
+process_benign_scenario() {
+    local SCENARIO="$1"
+    local SUBDIR="$2"
+    local BASE_URL="$3"
+    local OUTPUT_DIR="$4"
+
+    local CSV_PATH="$OUTPUT_DIR/${SCENARIO}.csv"
+
+    if [[ -f "$CSV_PATH" ]]; then
+        echo "[SKIP] $SCENARIO"
+        return 0
+    fi
+
+    local LOG_URL="$BASE_URL/$SCENARIO/$SUBDIR/bro/conn.log.labeled"
+    local TEMP_LOG="$OUTPUT_DIR/${SCENARIO}.tmp"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "[START] $SCENARIO (benign - $SUBDIR)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    download_and_process "$SCENARIO" "$LOG_URL" "$TEMP_LOG" "$CSV_PATH"
+}
+
+# Common download and processing function
+download_and_process() {
+    local SCENARIO="$1"
+    local LOG_URL="$2"
+    local TEMP_LOG="$3"
+    local CSV_PATH="$4"
+
+    DOWNLOAD_SUCCESS=false
 
     # Check if aria2c is available, fallback to wget
     if command -v aria2c >/dev/null 2>&1; then
@@ -68,31 +131,27 @@ process_scenario() {
             --max-tries=5 \
             --retry-wait=3 \
             --connect-timeout=60 \
-            --timeout=180 \
+            --timeout=300 \
             --allow-overwrite=true \
             --auto-file-renaming=false \
             --console-log-level=warn \
-            -d "$OUTPUT_DIR" \
-            -o "${SCENARIO}.tmp" \
+            -o "$(basename "$TEMP_LOG")" \
+            -d "$(dirname "$TEMP_LOG")" \
             "$LOG_URL" 2>&1 | grep -v "^$"; then
 
             DOWNLOAD_SUCCESS=true
-        else
-            DOWNLOAD_SUCCESS=false
         fi
     else
         # Fallback to wget if aria2c not available
         if wget --progress=bar:force:noscroll \
                 -c \
-                --timeout=180 \
+                --timeout=300 \
                 --tries=10 \
                 -O "$TEMP_LOG" \
                 "$LOG_URL" 2>&1 | \
                 grep --line-buffered -E '^[0-9]+%|saved'; then
 
             DOWNLOAD_SUCCESS=true
-        else
-            DOWNLOAD_SUCCESS=false
         fi
     fi
 
@@ -128,6 +187,7 @@ process_scenario() {
         echo ""
     else
         echo "[ERROR] $SCENARIO: download failed."
+        echo "URL tried: $LOG_URL"
         rm -f "$TEMP_LOG"
         echo ""
         return 1
@@ -135,7 +195,10 @@ process_scenario() {
 }
 
 # Export for subshells
-export -f process_scenario
+export -f process_standard_scenario
+export -f process_labeled_scenario
+export -f process_benign_scenario
+export -f download_and_process
 export BASE_URL OUTPUT_DIR
 
 # Ensure output directory exists
@@ -152,34 +215,71 @@ else
     echo ""
 fi
 
+TOTAL_SCENARIOS=$((${#STANDARD_SCENARIOS[@]} + ${#LABELED_SCENARIOS[@]} + ${#BENIGN_SCENARIOS[@]}))
+
 echo "╔════════════════════════════════════════════════════╗"
-echo "║  IoT-23 Dataset Downloader - OPTIMIZED            ║"
+echo "║  IoT-23 Dataset Downloader - FULLY FIXED          ║"
 echo "║  Output: $OUTPUT_DIR                              ║"
 echo "║  Parallel Jobs: $MAX_JOBS                          ║"
-echo "║  Total Scenarios: ${#SCENARIOS[@]}                 ║"
+echo "║  Total Scenarios: $TOTAL_SCENARIOS                 ║"
 echo "╚════════════════════════════════════════════════════╝"
 echo ""
 
-# Use GNU parallel if available, otherwise fallback to manual parallelism
+# Process all scenarios
 if command -v parallel >/dev/null 2>&1; then
     echo "✓ Using GNU parallel for job management"
-    printf '%s\n' "${SCENARIOS[@]}" | parallel -j "$MAX_JOBS" --bar --line-buffer process_scenario {} "$BASE_URL" "$OUTPUT_DIR"
+
+    # Process standard scenarios
+    printf '%s\n' "${STANDARD_SCENARIOS[@]}" | \
+        parallel -j "$MAX_JOBS" --bar --line-buffer \
+        process_standard_scenario {} "$BASE_URL" "$OUTPUT_DIR"
+
+    # Process labeled scenarios
+    printf '%s\n' "${LABELED_SCENARIOS[@]}" | \
+        parallel -j "$MAX_JOBS" --bar --line-buffer \
+        process_labeled_scenario {} "$BASE_URL" "$OUTPUT_DIR"
+
+    # Process benign scenarios
+    for SCENARIO in "${!BENIGN_SCENARIOS[@]}"; do
+        echo "$SCENARIO|${BENIGN_SCENARIOS[$SCENARIO]}"
+    done | parallel -j "$MAX_JOBS" --bar --line-buffer --colsep '|' \
+        process_benign_scenario {1} {2} "$BASE_URL" "$OUTPUT_DIR"
 else
     echo "⚠ GNU parallel not found - using manual job control"
-    echo "  Install for better progress tracking:"
-    echo "    Ubuntu/Debian: sudo apt-get install parallel"
-    echo "    macOS: brew install parallel"
     echo ""
 
     JOB_COUNT=0
-    for SCENARIO in "${SCENARIOS[@]}"; do
+
+    # Process standard scenarios
+    for SCENARIO in "${STANDARD_SCENARIOS[@]}"; do
         while (( JOB_COUNT >= MAX_JOBS )); do
             sleep 0.5
             JOB_COUNT=$(jobs -r | wc -l)
         done
-        process_scenario "$SCENARIO" "$BASE_URL" "$OUTPUT_DIR" &
+        process_standard_scenario "$SCENARIO" "$BASE_URL" "$OUTPUT_DIR" &
         ((JOB_COUNT++))
     done
+
+    # Process labeled scenarios
+    for SCENARIO in "${LABELED_SCENARIOS[@]}"; do
+        while (( JOB_COUNT >= MAX_JOBS )); do
+            sleep 0.5
+            JOB_COUNT=$(jobs -r | wc -l)
+        done
+        process_labeled_scenario "$SCENARIO" "$BASE_URL" "$OUTPUT_DIR" &
+        ((JOB_COUNT++))
+    done
+
+    # Process benign scenarios
+    for SCENARIO in "${!BENIGN_SCENARIOS[@]}"; do
+        while (( JOB_COUNT >= MAX_JOBS )); do
+            sleep 0.5
+            JOB_COUNT=$(jobs -r | wc -l)
+        done
+        process_benign_scenario "$SCENARIO" "${BENIGN_SCENARIOS[$SCENARIO]}" "$BASE_URL" "$OUTPUT_DIR" &
+        ((JOB_COUNT++))
+    done
+
     wait
 fi
 
@@ -192,15 +292,20 @@ echo ""
 
 # Count successful downloads
 SUCCESS_COUNT=$(ls -1 "$OUTPUT_DIR"/*.csv 2>/dev/null | wc -l)
-echo "Successfully downloaded: $SUCCESS_COUNT / ${#SCENARIOS[@]} scenarios"
+echo "Successfully downloaded: $SUCCESS_COUNT / $TOTAL_SCENARIOS scenarios"
 echo ""
 
 # List any failed scenarios
-if (( SUCCESS_COUNT < ${#SCENARIOS[@]} )); then
+if (( SUCCESS_COUNT < TOTAL_SCENARIOS )); then
     echo "⚠ Failed scenarios:"
-    for SCENARIO in "${SCENARIOS[@]}"; do
+    for SCENARIO in "${STANDARD_SCENARIOS[@]}" "${LABELED_SCENARIOS[@]}"; do
         if [[ ! -f "$OUTPUT_DIR/${SCENARIO}.csv" ]]; then
             echo "  - $SCENARIO"
+        fi
+    done
+    for SCENARIO in "${!BENIGN_SCENARIOS[@]}"; do
+        if [[ ! -f "$OUTPUT_DIR/${SCENARIO}.csv" ]]; then
+            echo "  - $SCENARIO (benign)"
         fi
     done
     echo ""
