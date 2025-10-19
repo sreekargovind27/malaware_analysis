@@ -371,26 +371,26 @@ class MultiClassNeuralNetModel:
 
         def objective(trial):
             # ======================================================================
-            # F***ING MORE PRINTS FOR DEBUGGING - START
+            # HYPER-VERBOSE DEBUGGING - START
             # ======================================================================
             print(f"\n--- [NN] Starting Optuna Trial {trial.number} at {time.strftime('%H:%M:%S')} ---")
 
             print("  [1/8] Suggesting parameters...")
             n_layers = trial.suggest_int('n_layers', 2, 4)
-            hidden_layers = []
-            for i in range(n_layers):
-                layer_size = trial.suggest_categorical(f'layer_{i+1}', [32, 64, 128, 256])
-                hidden_layers.append(layer_size)
-
+            # Use GPU-friendly layer sizes
+            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+            # Use larger batch sizes
             batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384, 32768, 65536])
             print("  [2/8] ✓ Parameters suggested.")
-            print(f"      - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
+            print(
+                f"      - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
 
             print("  [3/8] Creating model, optimizer, criterion...")
-            temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate, use_batch_norm).to(self.device)
+            temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
+                                             use_batch_norm).to(self.device)
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.CrossEntropyLoss()
             print("  [4/8] ✓ Model components created.")
@@ -400,58 +400,98 @@ class MultiClassNeuralNetModel:
             val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
             print("  [6/8] ✓ DataLoaders created. Starting training loop.")
 
-            num_epochs = min(20, 50)
+            num_epochs = 40  # Increased number of epochs
             best_val_acc = 0
             patience_counter = 0
 
-            for epoch in range(num_epochs):
-                epoch_start_time = time.time()
-                print(f"    [Epoch {epoch+1}/{num_epochs}] Starting...")
+            try:
+                for epoch in range(num_epochs):
+                    epoch_start_time = time.time()
+                    print(f"    [Epoch {epoch + 1}/{num_epochs}] Starting...")
 
-                temp_model.train()
-                for i, (X_batch, y_batch) in enumerate(train_loader):
-                    if i == 0: print(f"      - First training batch received. Shape: {X_batch.shape}")
-                    temp_optimizer.zero_grad()
-                    outputs = temp_model(X_batch)
-                    loss = temp_criterion(outputs, y_batch)
-                    loss.backward()
-                    temp_optimizer.step()
-                if i > 0: print(f"      - Last training batch processed. Total batches: {i+1}")
+                    temp_model.train()
+                    # Loop through training data
+                    for i, (X_batch, y_batch) in enumerate(train_loader):
+                        # For the first 5 batches, print detailed timing
+                        if i < 5:
+                            print(f"\n      --- Batch {i} ---")
+                            torch.cuda.synchronize();
+                            t0 = time.time()
 
-                print(f"      - Starting validation...")
-                temp_model.eval()
-                val_correct, val_total = 0, 0
-                with torch.no_grad():
-                    for i, (X_batch, y_batch) in enumerate(val_loader):
-                        if i == 0: print(f"        - First validation batch received. Shape: {X_batch.shape}")
-                        outputs = temp_model(X_batch)
-                        _, predicted = torch.max(outputs, 1)
-                        val_total += y_batch.size(0)
-                        val_correct += (predicted == y_batch).sum().item()
-                if i > 0: print(f"        - Last validation batch processed. Total batches: {i+1}")
+                            temp_optimizer.zero_grad()
+                            torch.cuda.synchronize();
+                            t1 = time.time()
+                            if i < 5: print(f"      zero_grad:  {t1 - t0:.6f}s")
 
-                val_acc = val_correct / val_total
-                epoch_time = time.time() - epoch_start_time
-                print(f"    [Epoch {epoch+1}/{num_epochs}] Finished in {epoch_time:.2f}s. Val Acc: {val_acc:.4f}")
+                            outputs = temp_model(X_batch)
+                            torch.cuda.synchronize();
+                            t2 = time.time()
+                            if i < 5: print(f"      forward:    {t2 - t1:.6f}s")
 
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= 5:
-                        print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
-                        break
+                            loss = temp_criterion(outputs, y_batch)
+                            torch.cuda.synchronize();
+                            t3 = time.time()
+                            if i < 5: print(f"      loss_calc:  {t3 - t2:.6f}s")
 
-                trial.report(val_acc, epoch)
-                if trial.should_prune():
-                    print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
-                    raise optuna.TrialPruned()
+                            loss.backward()
+                            torch.cuda.synchronize();
+                            t4 = time.time()
+                            if i < 5: print(f"      backward:   {t4 - t3:.6f}s")
 
-            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
+                            temp_optimizer.step()
+                            torch.cuda.synchronize();
+                            t5 = time.time()
+                            if i < 5: print(f"      step:       {t5 - t4:.6f}s")
+                        else:
+                            # After the first 5 batches, run without timing for speed
+                            temp_optimizer.zero_grad()
+                            outputs = temp_model(X_batch)
+                            loss = temp_criterion(outputs, y_batch)
+                            loss.backward()
+                            temp_optimizer.step()
+
+                    print(f"      - Training for epoch {epoch + 1} complete.")
+
+                    print(f"      - Starting validation...")
+                    temp_model.eval()
+                    val_correct, val_total = 0, 0
+                    with torch.no_grad():
+                        for (X_batch, y_batch) in val_loader:
+                            outputs = temp_model(X_batch)
+                            _, predicted = torch.max(outputs, 1)
+                            val_total += y_batch.size(0)
+                            val_correct += (predicted == y_batch).sum().item()
+
+                    val_acc = val_correct / val_total
+                    epoch_time = time.time() - epoch_start_time
+                    print(f"    [Epoch {epoch + 1}/{num_epochs}] Finished in {epoch_time:.2f}s. Val Acc: {val_acc:.4f}")
+
+                    if val_acc > best_val_acc:
+                        best_val_acc = val_acc
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= 5:
+                            print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
+                            break
+
+                    trial.report(val_acc, epoch)
+                    if trial.should_prune():
+                        print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
+                        raise optuna.TrialPruned()
+
+            except Exception as e:
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                print(f"!!!!!!!!!!!!!! CRITICAL ERROR !!!!!!!!!!!!!!!")
+                import traceback
+                traceback.print_exc()
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                raise e
+
+            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
             return best_val_acc
             # ======================================================================
-            # F***ING MORE PRINTS FOR DEBUGGING - END
+            # HYPER-VERBOSE DEBUGGING - END
             # ======================================================================
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
