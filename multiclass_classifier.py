@@ -1,7 +1,7 @@
 """
 Multi-Class Classification: Attack Type Detection
 Uses XGBoost and PyTorch Neural Network with SMOTE and Optuna optimization.
-UPDATED: Added detailed timing, SMOTE for imbalance, and Optuna tuning.
+UPDATED: Added Optuna tuning for Neural Network + detailed timing.
 """
 
 import os
@@ -10,13 +10,11 @@ import time
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
-# Optuna imports
 import optuna
 import seaborn as sns
 import torch
 import torch.nn as nn
 import xgboost as xgb
-# SMOTE imports
 from imblearn.over_sampling import SMOTE
 from optuna.samplers import TPESampler
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
@@ -42,7 +40,6 @@ class MultiClassXGBoost:
         print(f"  Using Optuna: {Config.USE_OPTUNA}")
         print(f"  Using SMOTE: {Config.USE_SMOTE}")
 
-    # ===== THIS IS THE ONLY FUNCTION THAT IS UPDATED =====
     def apply_smote(self, X_train, y_train):
         """Apply SMOTE (oversampling only) for class imbalance."""
         print("\n" + "=" * 70)
@@ -65,14 +62,10 @@ class MultiClassXGBoost:
 
         print(f"\n⏳ Applying SMOTE (Oversampling only)...")
         try:
-            # Set a target sample count for the minority classes.
-            # A good heuristic is a fraction of the second-largest class, or a fixed minimum.
             sorted_counts = sorted(counts, reverse=True)
-            # Ensure there are at least two classes to get sorted_counts[1]
             if len(sorted_counts) > 1:
-                target_sampling_count = max(500,
-                                            int(sorted_counts[1] * 0.2))  # At least 500, or 20% of 2nd largest class
-            else:  # Handle case with only one class (though unlikely)
+                target_sampling_count = max(500, int(sorted_counts[1] * 0.2))
+            else:
                 target_sampling_count = sorted_counts[0]
 
             sampling_strategy = {}
@@ -111,8 +104,6 @@ class MultiClassXGBoost:
             t_elapsed = time.time() - t_start
             print(f"⏱️  Time: {t_elapsed:.2f}s")
             return X_train, y_train
-
-    # =================================================================
 
     def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
         """Use Optuna to find best hyperparameters."""
@@ -169,11 +160,11 @@ class MultiClassXGBoost:
 
     def train(self, X_train, y_train, X_val=None, y_val=None, use_smote=True, use_optuna=True):
         """Train multi-class XGBoost classifier"""
-        print("\n" + "=" * 70);
-        print("🚀 TRAINING MULTI-CLASS XGBOOST");
+        print("\n" + "=" * 70)
+        print("🚀 TRAINING MULTI-CLASS XGBOOST")
         print("=" * 70)
         overall_start = time.time()
-        self.num_classes = len(np.unique(np.concatenate((y_train, y_test))))
+        self.num_classes = len(np.unique(y_train))
         print(
             f"\n📊 Training data:\n   Samples: {len(X_train):,}\n   Features: {X_train.shape[1]}\n   Classes: {self.num_classes}")
         unique, counts = np.unique(y_train, return_counts=True)
@@ -186,8 +177,8 @@ class MultiClassXGBoost:
         else:
             best_params = self._get_default_params()
             print("\n⏭️  Using default parameters (no optimization)")
-        print("\n" + "=" * 70);
-        print("🎯 TRAINING FINAL MODEL");
+        print("\n" + "=" * 70)
+        print("🎯 TRAINING FINAL MODEL")
         print("=" * 70)
         t_train_start = time.time()
         if len(np.unique(y_train)) > 1:
@@ -196,10 +187,10 @@ class MultiClassXGBoost:
             print(f"\n⚖️  Using class weights for imbalance")
         else:
             sample_weights = None
-        print(f"\n⏳ Training XGBoost...");
+        print(f"\n⏳ Training XGBoost...")
         self.model = xgb.XGBClassifier(**best_params)
         self.model.fit(X_train, y_train, sample_weight=sample_weights)
-        t_train = time.time() - t_train_start;
+        t_train = time.time() - t_train_start
         total_time = time.time() - overall_start
         print(
             f"\n✅ Training complete\n⏱️  Training time: {t_train:.2f}s\n⏱️  Total time: {total_time:.2f}s ({total_time / 60:.1f} min)")
@@ -208,40 +199,40 @@ class MultiClassXGBoost:
         return self.model.predict(X)
 
     def evaluate(self, X_test, y_test, label_encoder=None):
-        print("\n" + "=" * 70);
-        print("📊 EVALUATING MULTI-CLASS XGBOOST");
+        print("\n" + "=" * 70)
+        print("📊 EVALUATING MULTI-CLASS XGBOOST")
         print("=" * 70)
         t_eval_start = time.time()
-        print(f"\n⏳ Generating predictions...");
+        print(f"\n⏳ Generating predictions...")
         t_pred_start = time.time()
-        y_pred = self.predict(X_test);
+        y_pred = self.predict(X_test)
         t_pred = time.time() - t_pred_start
         print(
             f"✓ Predictions complete ({t_pred:.2f}s)\n   Throughput: {len(X_test) / (t_pred if t_pred > 0 else 1):.0f} samples/sec")
         target_names = label_encoder.classes_ if label_encoder else [f'Class_{i}' for i in range(self.num_classes)]
-        print("\n" + "─" * 70);
-        print("CLASSIFICATION REPORT");
-        print("─" * 70);
+        print("\n" + "─" * 70)
+        print("CLASSIFICATION REPORT")
+        print("─" * 70)
         print(classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
         acc = accuracy_score(y_test, y_pred)
         print(f"\n{'─' * 70}\nOVERALL ACCURACY: {acc:.4f}\n{'─' * 70}")
         cm = confusion_matrix(y_test, y_pred)
         self._plot_confusion_matrix(cm, target_names)
-        t_eval = time.time() - t_eval_start;
+        t_eval = time.time() - t_eval_start
         print(f"\n⏱️  Total evaluation time: {t_eval:.2f}s")
         return {'accuracy': acc}
 
     def _plot_confusion_matrix(self, cm, target_names):
-        plt.figure(figsize=(12, 10));
+        plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names)
-        plt.title('Confusion Matrix - XGBoost Multi-Class');
-        plt.ylabel('True Label');
+        plt.title('Confusion Matrix - XGBoost Multi-Class')
+        plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
-        plt.xticks(rotation=45, ha='right');
-        plt.yticks(rotation=0);
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'multiclass_xgboost_confusion_matrix.png'), dpi=300);
-        plt.close();
+        plt.savefig(os.path.join(Config.RESULTS_DIR, 'multiclass_xgboost_confusion_matrix.png'), dpi=300)
+        plt.close()
         print("  ✓ Saved confusion matrix")
 
     def save_model(self, filename='multiclass_xgboost.pkl'):
@@ -251,41 +242,238 @@ class MultiClassXGBoost:
 
 
 class MultiClassNeuralNet(nn.Module):
-    """Neural network for multi-class classification"""
+    """Flexible neural network for multi-class classification"""
 
-    def __init__(self, input_dim, num_classes):
+    def __init__(self, input_dim, num_classes, hidden_layers=None, dropout_rate=0.3, use_batch_norm=True):
         super(MultiClassNeuralNet, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(), nn.BatchNorm1d(128), nn.Dropout(0.3),
-            nn.Linear(128, 64), nn.ReLU(), nn.BatchNorm1d(64), nn.Dropout(0.3),
-            nn.Linear(64, 32), nn.ReLU(), nn.BatchNorm1d(32), nn.Dropout(0.2),
-            nn.Linear(32, num_classes)
-        )
+
+        if hidden_layers is None:
+            hidden_layers = [128, 64, 32]
+
+        layers = []
+        prev_dim = input_dim
+
+        for i, hidden_dim in enumerate(hidden_layers):
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+
+        # Output layer
+        layers.append(nn.Linear(prev_dim, num_classes))
+
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.network(x)
 
 
 class MultiClassNeuralNetModel:
-    """Neural network model wrapper"""
+    """Neural network model wrapper with Optuna support"""
 
-    def __init__(self, input_dim, num_classes):
+    def __init__(self, input_dim, num_classes, hidden_layers=None, dropout_rate=None,
+                 learning_rate=None, use_batch_norm=True):
         self.device = Config.DEVICE
-        self.model = MultiClassNeuralNet(input_dim, num_classes).to(self.device)
+        self.input_dim = input_dim
         self.num_classes = num_classes
+
+        # Use provided params or defaults
+        self.hidden_layers = hidden_layers or [128, 64, 32]
+        self.dropout_rate = dropout_rate if dropout_rate is not None else 0.3
+        self.learning_rate = learning_rate or 0.001
+        self.use_batch_norm = use_batch_norm
+
+        self.model = MultiClassNeuralNet(
+            input_dim, num_classes, self.hidden_layers,
+            self.dropout_rate, self.use_batch_norm
+        ).to(self.device)
+
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.scaler = None
+        self.best_params = None
+
         print(f"Multi-Class Neural Net initialized on {self.device}")
         print(f"  Input dim: {input_dim}, Classes: {num_classes}")
+        print(f"  Hidden layers: {self.hidden_layers}")
+        print(f"  Dropout: {self.dropout_rate}")
+        print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Batch normalization: {self.use_batch_norm}")
 
-    def train(self, X_train, y_train, X_val, y_val):
+    def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
+        """Use Optuna to find best hyperparameters for Neural Network"""
+        print("\n" + "=" * 70)
+        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Neural Network)")
+        print("=" * 70)
+
+        t_start = time.time()
+
+        if not Config.USE_OPTUNA:
+            print("\n⏭️  Optuna disabled in config, using default parameters")
+            return {
+                'n_layers': 3,
+                'layer_1': 128,
+                'layer_2': 64,
+                'layer_3': 32,
+                'dropout_rate': 0.3,
+                'learning_rate': 0.001,
+                'batch_size': 4096,
+                'use_batch_norm': True
+            }
+
+        print(f"\n⏳ Running Optuna optimization...")
+        print(f"   Trials: {Config.OPTUNA_N_TRIALS}")
+        print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
+
+        # Scale data once for all trials
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        def objective(trial):
+            # Suggest architecture
+            n_layers = trial.suggest_int('n_layers', 2, 4)
+            hidden_layers = []
+            for i in range(n_layers):
+                layer_size = trial.suggest_int(f'layer_{i+1}', 32, 256)
+                hidden_layers.append(layer_size)
+
+            # Suggest regularization
+            dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
+            use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
+
+            # Suggest training params
+            learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+            batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048, 4096])
+
+            # Create model
+            temp_model = MultiClassNeuralNet(
+                self.input_dim, self.num_classes, hidden_layers,
+                dropout_rate, use_batch_norm
+            ).to(self.device)
+
+            temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
+            temp_criterion = nn.CrossEntropyLoss()
+
+            # Create data loaders
+            train_loader = DataLoader(
+                IoTDataset(X_train_scaled, y_train),
+                batch_size=batch_size, shuffle=True
+            )
+            val_loader = DataLoader(
+                IoTDataset(X_val_scaled, y_val),
+                batch_size=batch_size, shuffle=False
+            )
+
+            # Train for limited epochs
+            num_epochs = min(20, 50)
+            best_val_acc = 0
+            patience_counter = 0
+
+            for epoch in range(num_epochs):
+                # Train
+                temp_model.train()
+                for X_batch, y_batch in train_loader:
+                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                    temp_optimizer.zero_grad()
+                    outputs = temp_model(X_batch)
+                    loss = temp_criterion(outputs, y_batch)
+                    loss.backward()
+                    temp_optimizer.step()
+
+                # Validate
+                temp_model.eval()
+                val_correct = 0
+                val_total = 0
+                with torch.no_grad():
+                    for X_batch, y_batch in val_loader:
+                        X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                        outputs = temp_model(X_batch)
+                        _, predicted = torch.max(outputs, 1)
+                        val_total += y_batch.size(0)
+                        val_correct += (predicted == y_batch).sum().item()
+
+                val_acc = val_correct / val_total
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= 5:  # Early stop for optimization
+                        break
+
+                # Report intermediate value for pruning
+                trial.report(val_acc, epoch)
+
+                # Handle pruning
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+            return best_val_acc
+
+        sampler = TPESampler(seed=Config.RANDOM_STATE)
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=sampler,
+            pruner=optuna.pruners.MedianPruner()  # Prune bad trials early
+        )
+        study.optimize(
+            objective,
+            n_trials=Config.OPTUNA_N_TRIALS,
+            timeout=Config.OPTUNA_TIMEOUT,
+            show_progress_bar=True
+        )
+
+        t_elapsed = time.time() - t_start
+
+        print(f"\n✅ Optimization complete")
+        print(f"⏱️  Time: {t_elapsed:.2f}s ({t_elapsed / 60:.1f} min)")
+        print(f"\n📊 Best trial:")
+        print(f"   Validation Accuracy: {study.best_value:.4f}")
+        print(f"   Parameters:")
+        for key, value in study.best_params.items():
+            print(f"      {key}: {value}")
+
+        self.best_params = study.best_params
+        return study.best_params
+
+    def train(self, X_train, y_train, X_val, y_val, use_optuna=True):
         """Train neural network"""
         print("\n" + "=" * 70)
         print("🚀 TRAINING NEURAL NETWORK MULTI-CLASS")
         print("=" * 70)
 
         overall_start = time.time()
+
+        # Hyperparameter optimization
+        if use_optuna and Config.USE_OPTUNA:
+            best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
+
+            # Rebuild model with best parameters
+            n_layers = best_params['n_layers']
+            self.hidden_layers = [best_params[f'layer_{i+1}'] for i in range(n_layers)]
+            self.dropout_rate = best_params['dropout_rate']
+            self.learning_rate = best_params['learning_rate']
+            self.use_batch_norm = best_params['use_batch_norm']
+            batch_size = best_params['batch_size']
+
+            print("\n" + "=" * 70)
+            print("🎯 TRAINING FINAL MODEL WITH OPTIMIZED PARAMETERS")
+            print("=" * 70)
+
+            self.model = MultiClassNeuralNet(
+                self.input_dim, self.num_classes, self.hidden_layers,
+                self.dropout_rate, self.use_batch_norm
+            ).to(self.device)
+
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        else:
+            batch_size = 4096
+            print("\n⏭️  Using default parameters (no optimization)")
 
         # Calculate class weights
         print(f"\n⏳ Calculating class weights...")
@@ -304,8 +492,8 @@ class MultiClassNeuralNetModel:
 
         # Create data loaders
         print(f"\n⏳ Creating DataLoaders...")
-        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=4096, shuffle=True)
-        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=4096, shuffle=False)
+        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False)
         print(f"✓ DataLoaders created")
 
         # Training loop
@@ -429,7 +617,12 @@ class MultiClassNeuralNetModel:
         torch.save({
             'model_state': self.model.state_dict(),
             'scaler': self.scaler,
-            'num_classes': self.num_classes
+            'num_classes': self.num_classes,
+            'hidden_layers': self.hidden_layers,
+            'dropout_rate': self.dropout_rate,
+            'learning_rate': self.learning_rate,
+            'use_batch_norm': self.use_batch_norm,
+            'best_params': self.best_params
         }, filepath)
 
     def load_model(self, filename='multiclass_nn.pth'):
@@ -442,12 +635,13 @@ class MultiClassNeuralNetModel:
         self.model.load_state_dict(checkpoint['model_state'])
         self.scaler = checkpoint['scaler']
         self.num_classes = checkpoint['num_classes']
+        self.best_params = checkpoint.get('best_params')
 
 
 if __name__ == "__main__":
-    Config.set_seeds()
     Config.print_mode_info()
-    
+    Config.set_seeds()
+
     print("=" * 70)
     print("🎯 MULTI-CLASS CLASSIFICATION: ATTACK TYPE DETECTION")
     print("=" * 70)
@@ -476,18 +670,18 @@ if __name__ == "__main__":
     print("MODEL 1: XGBoost")
     print("=" * 70)
     xgb_model = MultiClassXGBoost()
-    xgb_model.train(X_train, y_train, X_val, y_val, use_smote=True, use_optuna=True)
+    xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
     xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
     xgb_model.save_model()
 
-    # Train Neural Network
+    # Train Neural Network with Optuna
     print("\n" + "=" * 70)
-    print("MODEL 2: Neural Network")
+    print("MODEL 2: Neural Network (with Optuna)")
     print("=" * 70)
     input_dim = X_train.shape[1]
     num_classes = len(np.unique(y_train))
     nn_model = MultiClassNeuralNetModel(input_dim, num_classes)
-    nn_model.train(X_tr_np, y_tr, X_val_np, y_val)
+    nn_model.train(X_tr_np, y_tr, X_val_np, y_val, use_optuna=True)
     nn_results = nn_model.evaluate(X_test.values, y_test, label_encoder)
     nn_model.save_model('multiclass_nn.pth')
 
