@@ -259,9 +259,9 @@ def get_data_for_multiclass():
     print("=" * 70)
 
     # Define the new, smaller target size (e.g., 30% of the original 50M sample)
-    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.30)
+    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.03)
     # Define what counts as a 'small' class that should be fully preserved
-    MINORITY_CLASS_THRESHOLD = 100000
+    MINORITY_CLASS_THRESHOLD = 200000
 
     print(f"   Original dataset size: {len(df):,} rows")
     print(f"   New target size: {NEW_TARGET_SIZE:,} rows")
