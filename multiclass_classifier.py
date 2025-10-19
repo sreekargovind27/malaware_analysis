@@ -1,7 +1,7 @@
 """
 Multi-Class Classification: Attack Type Detection
 Uses XGBoost and PyTorch Neural Network with SMOTE and Optuna optimization.
-UPDATED: Added Optuna tuning for Neural Network + detailed timing + F***ING MORE PRINTS.
+UPDATED: Added Optuna tuning, enhanced progress tracking, CUDA warmup, and pin_memory.
 """
 
 import os
@@ -120,7 +120,6 @@ class MultiClassXGBoost:
         print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
 
         def objective(trial):
-            # ADDED: Print to track start of XGBoost trial
             print(f"\n--- [XGBoost] Starting Optuna Trial {trial.number} ---")
             param = {'objective': 'multi:softmax', 'num_class': self.num_classes, 'tree_method': 'hist',
                      'n_estimators': trial.suggest_int('n_estimators', 50, 300),
@@ -134,7 +133,6 @@ class MultiClassXGBoost:
                      'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True), 'n_jobs': Config.N_JOBS,
                      'random_state': Config.RANDOM_STATE, 'eval_metric': 'mlogloss'}
 
-            # ADDED: Print params being used for this trial
             print(f"  - Params: n_estimators={param['n_estimators']}, max_depth={param['max_depth']}, lr={param['learning_rate']:.4f}")
             print("  - Training model...")
 
@@ -145,7 +143,6 @@ class MultiClassXGBoost:
             y_pred = model.predict(X_val)
             accuracy = accuracy_score(y_val, y_pred)
 
-            # ADDED: Print result of the trial
             print(f"--- [XGBoost] Trial {trial.number} finished. Accuracy: {accuracy:.4f} ---")
             return accuracy
 
@@ -304,6 +301,23 @@ class MultiClassNeuralNetModel:
             self.dropout_rate, self.use_batch_norm
         ).to(self.device)
 
+        # ADDED: CUDA Warmup Block
+        if self.device != 'cpu':
+            print("⏳ Warming up CUDA context and compiling kernels...")
+            try:
+                # Create a small dummy batch on CPU, then move to GPU
+                dummy_input = torch.randn(256, input_dim, device=self.device)
+
+                # Run a dummy forward pass to force kernel compilation
+                _ = self.model(dummy_input)
+
+                # Wait for the GPU to finish the operation
+                torch.cuda.synchronize()
+
+                print("✓ CUDA warmup complete.")
+            except Exception as e:
+                print(f"⚠️ CUDA Warmup failed: {e}. Proceeding without warmup.")
+
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.scaler = None
@@ -349,7 +363,6 @@ class MultiClassNeuralNetModel:
         print("   ✓ Data scaled.")
 
         def objective(trial):
-            # ADDED: Print statement to track which trial is starting
             print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
 
             # Suggest architecture
@@ -367,7 +380,6 @@ class MultiClassNeuralNetModel:
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
             batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048, 4096])
 
-            # ADDED: Print the hyperparameters for the current trial
             print(f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
 
             # Create model
@@ -380,16 +392,18 @@ class MultiClassNeuralNetModel:
             temp_criterion = nn.CrossEntropyLoss()
 
             # Create data loaders
-            print("  - Creating DataLoaders...") # ADDED
+            print("  - Creating DataLoaders...")
             train_loader = DataLoader(
                 IoTDataset(X_train_scaled, y_train),
-                batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS
+                batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS,
+                pin_memory=True # ADDED: pin_memory=True
             )
             val_loader = DataLoader(
                 IoTDataset(X_val_scaled, y_val),
-                batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS
+                batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS,
+                pin_memory=True # ADDED: pin_memory=True
             )
-            print("  - ✓ DataLoaders created. Starting training...") # ADDED
+            print("  - ✓ DataLoaders created. Starting training...")
 
             # Train for limited epochs
             num_epochs = min(20, 50)
@@ -421,7 +435,6 @@ class MultiClassNeuralNetModel:
 
                 val_acc = val_correct / val_total
 
-                # ADDED: Print progress for each epoch within a trial
                 print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
 
                 if val_acc > best_val_acc:
@@ -429,21 +442,16 @@ class MultiClassNeuralNetModel:
                     patience_counter = 0
                 else:
                     patience_counter += 1
-                    if patience_counter >= 5:  # Early stop for optimization
-                        # ADDED: Print statement for early stopping
+                    if patience_counter >= 5:
                         print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
                         break
 
-                # Report intermediate value for pruning
                 trial.report(val_acc, epoch)
 
-                # Handle pruning
                 if trial.should_prune():
-                    # ADDED: Print statement for pruning
                     print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
                     raise optuna.TrialPruned()
 
-            # ADDED: Print statement to confirm trial completion
             print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
             return best_val_acc
 
@@ -451,7 +459,7 @@ class MultiClassNeuralNetModel:
         study = optuna.create_study(
             direction='maximize',
             sampler=sampler,
-            pruner=optuna.pruners.MedianPruner()  # Prune bad trials early
+            pruner=optuna.pruners.MedianPruner()
         )
         study.optimize(
             objective,
@@ -481,11 +489,9 @@ class MultiClassNeuralNetModel:
 
         overall_start = time.time()
 
-        # Hyperparameter optimization
         if use_optuna and Config.USE_OPTUNA:
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
 
-            # Rebuild model with best parameters
             n_layers = best_params['n_layers']
             self.hidden_layers = [best_params[f'layer_{i+1}'] for i in range(n_layers)]
             self.dropout_rate = best_params['dropout_rate']
@@ -507,13 +513,11 @@ class MultiClassNeuralNetModel:
             batch_size = 4096
             print("\n⏭️  Using default parameters (no optimization)")
 
-        # Calculate class weights
         print(f"\n⚖️  Calculating class weights...")
         class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
         self.criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(self.device))
         print(f"✓ Class weights calculated")
 
-        # Scale data
         print(f"\n⏳ Scaling features...")
         t_scale_start = time.time()
         self.scaler = StandardScaler()
@@ -522,25 +526,22 @@ class MultiClassNeuralNetModel:
         t_scale = time.time() - t_scale_start
         print(f"✓ Scaling complete ({t_scale:.2f}s)")
 
-        # Create data loaders
         print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,})...")
-        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS)
-        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS)
+        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS, pin_memory=True) # ADDED: pin_memory=True
+        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False,
+                                num_workers=Config.NUM_WORKERS, pin_memory=True)  # ADDED: pin_memory=True
         print(f"✓ DataLoaders created")
 
-        # Training loop
         print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
         t_train_start = time.time()
 
         best_val_acc = 0
         patience_counter = 0
 
-        # MODIFIED: Changed the tqdm loop to allow for setting a postfix with metrics
         progress_bar = tqdm(range(50), desc="Training")
         for epoch in progress_bar:
-            # Train
             self.model.train()
-            total_train_loss = 0 # ADDED: Variable to track training loss per epoch
+            total_train_loss = 0
             for X_batch, y_batch in train_loader:
                 X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -548,30 +549,25 @@ class MultiClassNeuralNetModel:
                 loss = self.criterion(outputs, y_batch)
                 loss.backward()
                 self.optimizer.step()
-                total_train_loss += loss.item() # ADDED: Accumulate training loss
+                total_train_loss += loss.item()
 
-            # ADDED: Calculate average training loss for the epoch
             avg_train_loss = total_train_loss / len(train_loader)
 
-            # Validate
             self.model.eval()
-            val_correct = 0
-            val_total = 0
-            total_val_loss = 0 # ADDED: Variable to track validation loss per epoch
+            val_correct, val_total, total_val_loss = 0, 0, 0
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
                     X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
                     outputs = self.model(X_batch)
-                    loss = self.criterion(outputs, y_batch) # ADDED: Calculate validation loss
-                    total_val_loss += loss.item() # ADDED: Accumulate validation loss
+                    loss = self.criterion(outputs, y_batch)
+                    total_val_loss += loss.item()
                     _, predicted = torch.max(outputs, 1)
                     val_total += y_batch.size(0)
                     val_correct += (predicted == y_batch).sum().item()
 
             val_acc = val_correct / val_total
-            avg_val_loss = total_val_loss / len(val_loader) # ADDED: Calculate average validation loss
+            avg_val_loss = total_val_loss / len(val_loader)
 
-            # ADDED: Update the tqdm progress bar with live metrics after each epoch
             progress_bar.set_postfix({
                 'Train Loss': f'{avg_train_loss:.4f}',
                 'Val Loss': f'{avg_val_loss:.4f}',
@@ -579,7 +575,6 @@ class MultiClassNeuralNetModel:
                 'Best Acc': f'{best_val_acc:.4f}'
             })
 
-            # Early stopping
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 patience_counter = 0
@@ -590,7 +585,6 @@ class MultiClassNeuralNetModel:
                     print(f"\n  Early stopping at epoch {epoch + 1}")
                     break
 
-        # Load best model
         self.load_model('best_multiclass_nn.pth')
 
         t_train = time.time() - t_train_start
@@ -626,7 +620,7 @@ class MultiClassNeuralNetModel:
         y_pred = self.predict(X_test)
         t_pred = time.time() - t_pred_start
         print(f"✓ Predictions complete ({t_pred:.2f}s)")
-        print(f"   Throughput: {len(X_test) / t_pred:.0f} samples/sec")
+        print(f"   Throughput: {len(X_test) / (t_pred if t_pred > 0 else 1):.0f} samples/sec")
 
         target_names = label_encoder.classes_ if label_encoder else [f'Class_{i}' for i in range(self.num_classes)]
 
@@ -717,13 +711,13 @@ if __name__ == "__main__":
     X_val_np = X_val.values
 
     # Train XGBoost
-    # print("\n" + "=" * 70)
-    # print("MODEL 1: XGBoost")
-    # print("=" * 70)
-    # xgb_model = MultiClassXGBoost()
-    # xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
-    # xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
-    # xgb_model.save_model()
+    print("\n" + "=" * 70)
+    print("MODEL 1: XGBoost")
+    print("=" * 70)
+    xgb_model = MultiClassXGBoost()
+    xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
+    xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
+    xgb_model.save_model()
 
     # Train Neural Network with Optuna
     print("\n" + "=" * 70)
@@ -743,7 +737,7 @@ if __name__ == "__main__":
     print("🎉 MULTI-CLASS CLASSIFICATION COMPLETE")
     print("=" * 70)
     print(f"\n📊 Model Comparison:")
-    # print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
+    print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
     print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
     print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")
