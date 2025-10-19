@@ -1,7 +1,7 @@
 """
 Multi-Class Classification: Attack Type Detection
 Uses XGBoost and PyTorch Neural Network with SMOTE and Optuna optimization.
-UPDATED: Implemented Strategy 2 (Pre-load data to GPU) for maximum speed.
+UPDATED: Added extensive debug prints to the NN objective function.
 """
 
 import os
@@ -21,11 +21,15 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset # Use TensorDataset
 from tqdm import tqdm
 
 from config import Config
-from data_loader import get_data_for_multiclass, IoTDataset
+from data_loader import get_data_for_multiclass
+
+
+# NOTE: IoTDataset is no longer needed from data_loader for this script
+#       but keeping the import in case other parts of your project use it.
 
 
 class MultiClassXGBoost:
@@ -301,19 +305,12 @@ class MultiClassNeuralNetModel:
             self.dropout_rate, self.use_batch_norm
         ).to(self.device)
 
-        # 1. ADDED: CUDA Warmup Block
         if self.device != 'cpu':
             print("⏳ Warming up CUDA context and compiling kernels...")
             try:
-                # Create a small dummy batch on CPU, then move to GPU
                 dummy_input = torch.randn(256, input_dim, device=self.device)
-
-                # Run a dummy forward pass to force kernel compilation
                 _ = self.model(dummy_input)
-
-                # Wait for the GPU to finish the operation
                 torch.cuda.synchronize()
-
                 print("✓ CUDA warmup complete.")
             except Exception as e:
                 print(f"⚠️ CUDA Warmup failed: {e}. Proceeding without warmup.")
@@ -336,8 +333,6 @@ class MultiClassNeuralNetModel:
         print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Neural Network)")
         print("=" * 70)
 
-        t_start = time.time()
-
         if not Config.USE_OPTUNA:
             print("\n⏭️  Optuna disabled in config, using default parameters")
             return {
@@ -355,94 +350,83 @@ class MultiClassNeuralNetModel:
         print(f"   Trials: {Config.OPTUNA_N_TRIALS}")
         print(f"   Timeout: {Config.OPTUNA_TIMEOUT}s ({Config.OPTUNA_TIMEOUT / 60:.1f} min)")
 
-        # Scale data once for all trials
         print("   Scaling data for Optuna...")
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
         print("   ✓ Data scaled.")
 
-        # --- STRATEGY 2 CHANGE ---
         print("   Pre-shuffling and moving Optuna data to GPU...")
-
-        # Create a single random permutation for the training data
         perm = torch.randperm(len(X_train_scaled))
-
-        # Apply the permutation to the NumPy arrays BEFORE converting to tensors
         X_train_shuffled = X_train_scaled[perm]
         y_train_shuffled = y_train[perm]
-
-        # Move the pre-shuffled data to the GPU
         X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
         y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
         X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
         y_val_gpu = torch.LongTensor(y_val).to(self.device)
-
-        # Clean up all CPU copies to save RAM
         del X_train_scaled, X_val_scaled, X_train_shuffled, y_train_shuffled, perm
         print("   ✓ Optuna data is on GPU and pre-shuffled.")
 
         def objective(trial):
-            print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
+            # ======================================================================
+            # F***ING MORE PRINTS FOR DEBUGGING - START
+            # ======================================================================
+            print(f"\n--- [NN] Starting Optuna Trial {trial.number} at {time.strftime('%H:%M:%S')} ---")
 
-            # Suggest architecture
+            print("  [1/8] Suggesting parameters...")
             n_layers = trial.suggest_int('n_layers', 2, 4)
-            hidden_layers = []
-            for i in range(n_layers):
-                layer_size = trial.suggest_int(f'layer_{i+1}', 32, 256)
-                hidden_layers.append(layer_size)
-
-            # Suggest regularization
+            hidden_layers = [trial.suggest_int(f'layer_{i+1}', 32, 256) for i in range(n_layers)]
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
-
-            # Suggest training params
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
             batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048, 4096])
+            print("  [2/8] ✓ Parameters suggested.")
+            print(f"      - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
 
-            print(f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
-
-            # Create model
-            temp_model = MultiClassNeuralNet(
-                self.input_dim, self.num_classes, hidden_layers,
-                dropout_rate, use_batch_norm
-            ).to(self.device)
-
+            print("  [3/8] Creating model, optimizer, criterion...")
+            temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate, use_batch_norm).to(self.device)
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.CrossEntropyLoss()
+            print("  [4/8] ✓ Model components created.")
 
-            # Create data loaders from GPU tensors
-            train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
-            val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
+            print("  [5/8] Creating DataLoaders...")
+            train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
+            val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
+            print("  [6/8] ✓ DataLoaders created. Starting training loop.")
 
             num_epochs = min(20, 50)
             best_val_acc = 0
             patience_counter = 0
 
             for epoch in range(num_epochs):
-                # Train
+                epoch_start_time = time.time()
+                print(f"    [Epoch {epoch+1}/{num_epochs}] Starting...")
+
                 temp_model.train()
-                for X_batch, y_batch in train_loader:
-                    # Data is already on GPU, no need for .to(device)
+                for i, (X_batch, y_batch) in enumerate(train_loader):
+                    if i == 0: print(f"      - First training batch received. Shape: {X_batch.shape}")
                     temp_optimizer.zero_grad()
                     outputs = temp_model(X_batch)
                     loss = temp_criterion(outputs, y_batch)
                     loss.backward()
                     temp_optimizer.step()
+                if i > 0: print(f"      - Last training batch processed. Total batches: {i+1}")
 
-                # Validate
+                print(f"      - Starting validation...")
                 temp_model.eval()
                 val_correct, val_total = 0, 0
                 with torch.no_grad():
-                    for X_batch, y_batch in val_loader:
-                        # Data is already on GPU
+                    for i, (X_batch, y_batch) in enumerate(val_loader):
+                        if i == 0: print(f"        - First validation batch received. Shape: {X_batch.shape}")
                         outputs = temp_model(X_batch)
                         _, predicted = torch.max(outputs, 1)
                         val_total += y_batch.size(0)
                         val_correct += (predicted == y_batch).sum().item()
+                if i > 0: print(f"        - Last validation batch processed. Total batches: {i+1}")
 
                 val_acc = val_correct / val_total
-                print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
+                epoch_time = time.time() - epoch_start_time
+                print(f"    [Epoch {epoch+1}/{num_epochs}] Finished in {epoch_time:.2f}s. Val Acc: {val_acc:.4f}")
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -460,6 +444,9 @@ class MultiClassNeuralNetModel:
 
             print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
             return best_val_acc
+            # ======================================================================
+            # F***ING MORE PRINTS FOR DEBUGGING - END
+            # ======================================================================
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
         study = optuna.create_study(direction='maximize', sampler=sampler, pruner=optuna.pruners.MedianPruner())
@@ -485,7 +472,6 @@ class MultiClassNeuralNetModel:
         overall_start = time.time()
 
         if use_optuna and Config.USE_OPTUNA:
-            # Pass original numpy arrays to Optuna, which handles its own GPU transfer
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
 
             n_layers = best_params['n_layers']
@@ -522,30 +508,20 @@ class MultiClassNeuralNetModel:
         t_scale = time.time() - t_scale_start
         print(f"✓ Scaling complete ({t_scale:.2f}s)")
 
-        # --- STRATEGY 2 CHANGE ---
-        # --- STRATEGY 2 CHANGE ---
         print(f"⏳ Pre-shuffling and moving final training data to GPU...")
-
-        # Create a single random permutation for the training data
         perm = torch.randperm(len(X_train_scaled))
-
-        # Apply the permutation to the NumPy arrays
         X_train_shuffled = X_train_scaled[perm]
         y_train_shuffled = y_train[perm]
-
-        # Move the pre-shuffled data to the GPU
         X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
         y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
         X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
         y_val_gpu = torch.LongTensor(y_val).to(self.device)
-
-        # Clean up all CPU copies to save RAM
         del X_train_scaled, X_val_scaled, X_train, y_train, X_val, y_val, X_train_shuffled, y_train_shuffled, perm
         print("✓ Final training data is on GPU and pre-shuffled.")
 
         print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,})...")
-        train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
         print(f"✓ DataLoaders created")
 
         print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
@@ -559,7 +535,6 @@ class MultiClassNeuralNetModel:
             self.model.train()
             total_train_loss = 0
             for X_batch, y_batch in train_loader:
-                # Data is already on GPU
                 self.optimizer.zero_grad()
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
@@ -573,7 +548,6 @@ class MultiClassNeuralNetModel:
             val_correct, val_total, total_val_loss = 0, 0, 0
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
-                    # Data is already on GPU
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
                     total_val_loss += loss.item()
@@ -615,7 +589,6 @@ class MultiClassNeuralNetModel:
         if hasattr(X, 'values'):
             X = X.values
         X_scaled = self.scaler.transform(X)
-        # Prediction data also needs to be moved to GPU
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
         self.model.eval()
         with torch.no_grad():
