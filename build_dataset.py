@@ -429,9 +429,12 @@ def build_engineered_dataset():
         )
 
         if Config.SAMPLE_SIZE:
-            print(f"⏳ Sampling {Config.SAMPLE_SIZE:,} rows...")
-            total_est = len(ddf)
-            sample_frac = min(1.0, Config.SAMPLE_SIZE / total_est)
+            # Calculate fraction WITHOUT computing full length
+            # Estimate: 247M rows total, want 50M = ~0.2 fraction
+            sample_frac = Config.SAMPLE_SIZE / 250000000  # Rough estimate of total rows
+            sample_frac = min(0.99, sample_frac)  # Cap at 99%
+
+            print(f"⏳ Sampling ~{Config.SAMPLE_SIZE:,} rows (frac={sample_frac:.3f})...")
             ddf = ddf.sample(frac=sample_frac, random_state=Config.RANDOM_STATE)
 
         print("\n⏳ Building feature list...")
