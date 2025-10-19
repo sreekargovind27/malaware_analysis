@@ -711,13 +711,13 @@ if __name__ == "__main__":
     X_val_np = X_val.values
 
     # Train XGBoost
-    print("\n" + "=" * 70)
-    print("MODEL 1: XGBoost")
-    print("=" * 70)
-    xgb_model = MultiClassXGBoost()
-    xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
-    xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
-    xgb_model.save_model()
+    # print("\n" + "=" * 70)
+    # print("MODEL 1: XGBoost")
+    # print("=" * 70)
+    # xgb_model = MultiClassXGBoost()
+    # xgb_model.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
+    # xgb_results = xgb_model.evaluate(X_test, y_test, label_encoder)
+    # xgb_model.save_model()
 
     # Train Neural Network with Optuna
     print("\n" + "=" * 70)
@@ -737,7 +737,7 @@ if __name__ == "__main__":
     print("🎉 MULTI-CLASS CLASSIFICATION COMPLETE")
     print("=" * 70)
     print(f"\n📊 Model Comparison:")
-    print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
+    # print(f"   XGBoost Accuracy:        {xgb_results['accuracy']:.4f}")
     print(f"   Neural Network Accuracy: {nn_results['accuracy']:.4f}")
     print(f"\n⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print("\n✅ Multi-class classifiers trained and saved!")
