@@ -363,13 +363,24 @@ class MultiClassNeuralNetModel:
         print("   ✓ Data scaled.")
 
         # --- STRATEGY 2 CHANGE ---
-        print("   Moving Optuna data to GPU...")
-        X_train_gpu = torch.FloatTensor(X_train_scaled).to(self.device)
-        y_train_gpu = torch.LongTensor(y_train).to(self.device)
+        print("   Pre-shuffling and moving Optuna data to GPU...")
+
+        # Create a single random permutation for the training data
+        perm = torch.randperm(len(X_train_scaled))
+
+        # Apply the permutation to the NumPy arrays BEFORE converting to tensors
+        X_train_shuffled = X_train_scaled[perm]
+        y_train_shuffled = y_train[perm]
+
+        # Move the pre-shuffled data to the GPU
+        X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
+        y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
         X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
         y_val_gpu = torch.LongTensor(y_val).to(self.device)
-        del X_train_scaled, X_val_scaled # Free up RAM
-        print("   ✓ Optuna data is on GPU.")
+
+        # Clean up all CPU copies to save RAM
+        del X_train_scaled, X_val_scaled, X_train_shuffled, y_train_shuffled, perm
+        print("   ✓ Optuna data is on GPU and pre-shuffled.")
 
         def objective(trial):
             print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
@@ -401,7 +412,7 @@ class MultiClassNeuralNetModel:
             temp_criterion = nn.CrossEntropyLoss()
 
             # Create data loaders from GPU tensors
-            train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=True)
+            train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
             val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
 
             num_epochs = min(20, 50)
@@ -512,16 +523,28 @@ class MultiClassNeuralNetModel:
         print(f"✓ Scaling complete ({t_scale:.2f}s)")
 
         # --- STRATEGY 2 CHANGE ---
-        print(f"⏳ Moving final training data to GPU...")
-        X_train_gpu = torch.FloatTensor(X_train_scaled).to(self.device)
-        y_train_gpu = torch.LongTensor(y_train).to(self.device)
+        # --- STRATEGY 2 CHANGE ---
+        print(f"⏳ Pre-shuffling and moving final training data to GPU...")
+
+        # Create a single random permutation for the training data
+        perm = torch.randperm(len(X_train_scaled))
+
+        # Apply the permutation to the NumPy arrays
+        X_train_shuffled = X_train_scaled[perm]
+        y_train_shuffled = y_train[perm]
+
+        # Move the pre-shuffled data to the GPU
+        X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
+        y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
         X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
         y_val_gpu = torch.LongTensor(y_val).to(self.device)
-        del X_train_scaled, X_val_scaled, X_train, y_train, X_val, y_val # Free up RAM
-        print("✓ Final training data is on GPU.")
+
+        # Clean up all CPU copies to save RAM
+        del X_train_scaled, X_val_scaled, X_train, y_train, X_val, y_val, X_train_shuffled, y_train_shuffled, perm
+        print("✓ Final training data is on GPU and pre-shuffled.")
 
         print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,})...")
-        train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
         val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
         print(f"✓ DataLoaders created")
 
