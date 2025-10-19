@@ -18,7 +18,7 @@ from tqdm import tqdm
 from config import Config
 
 # ==================== OPTIMIZATION 1: LARGER CHUNK SIZE ====================
-CHUNK_SIZE = 1500000  # 1.5 mil
+CHUNK_SIZE = 7000000  # 7 mil
 
 # ==================== OPTIMIZATION 2: USE ALL CPU CORES ====================
 MAX_WORKERS = min(8, cpu_count() - 1)
