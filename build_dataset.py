@@ -9,7 +9,6 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
-import dask.dataframe as dd
 import joblib
 import numpy as np
 import pandas as pd
@@ -93,7 +92,7 @@ def _clean_and_expand_labels(df):
 
     if has_label_col:
         combined_str = (df['label'].astype(str).fillna('') + ' ' +
-                       df['detailed-label'].astype(str).fillna('')).str.lower().str.strip()
+                        df['detailed-label'].astype(str).fillna('')).str.lower().str.strip()
     else:
         combined_str = pd.Series([''] * len(df))
 
@@ -291,7 +290,7 @@ def _preprocess_partition(df, all_categorical_values):
 def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values):
     """OPTIMIZED: Write Parquet instead of CSV"""
     output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR,
-                                os.path.basename(file_path).replace('.csv', '.parquet'))
+                               os.path.basename(file_path).replace('.csv', '.parquet'))
 
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"\n  📄 {os.path.basename(file_path)} ({file_size_mb:.1f} MB)")
@@ -329,6 +328,7 @@ def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
     print(f"    ✅ {total_rows:,} rows | {t_elapsed:.1f}s | {throughput:.1f} MB/s")
 
     return total_rows
+
 
 def build_engineered_dataset():
     """OPTIMIZED: Parallel file processing"""
@@ -407,9 +407,9 @@ def build_engineered_dataset():
     print(f"   📊 Total rows: {total_rows:,}")
     print("=" * 70)
 
-    # ==================== STAGE 2: COMBINE ALL FILES ====================
+    # ==================== STAGE 2: COMBINE FILES (MEMORY-SAFE) ====================
     print("\n" + "=" * 70)
-    print("🔍 STAGE 2: COMBINING WITH DASK")
+    print("🔍 STAGE 2: COMBINING FILES (PANDAS)")
     print("=" * 70)
 
     stage2_start = time.time()
@@ -419,86 +419,53 @@ def build_engineered_dataset():
         print("❌ No engineered files found")
         return
 
-    print(f"📁 Found {len(split_files)} files to combine")
+    print(f"📁 Found {len(split_files)} files")
+    print(f"⏳ Loading first 10 files (memory-safe)...")
 
-    try:
-        print("\n⏳ Reading with Dask...")
-        ddf = dd.read_parquet(
-            os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet'),
-            blocksize='64MB'  # ← ADD THIS LINE
-        )
+    final_chunks = []
+    for pq_file in split_files[:10]:
+        print(f"  Loading {os.path.basename(pq_file)}...")
+        df_chunk = pd.read_parquet(pq_file)
+        final_chunks.append(df_chunk)
 
-        if Config.SAMPLE_SIZE:
-            # Calculate fraction WITHOUT computing full length
-            # Estimate: 247M rows total, want 50M = ~0.2 fraction
-            sample_frac = Config.SAMPLE_SIZE / 250000000  # Rough estimate of total rows
-            sample_frac = min(0.99, sample_frac)  # Cap at 99%
+    print(f"⏳ Concatenating...")
+    final_df = pd.concat(final_chunks, ignore_index=True)
+    print(f"✓ Combined {len(final_df):,} rows")
 
-            print(f"⏳ Sampling ~{Config.SAMPLE_SIZE:,} rows (frac={sample_frac:.3f})...")
-            ddf = ddf.sample(frac=sample_frac, random_state=Config.RANDOM_STATE)
+    # Sample if needed
+    if Config.SAMPLE_SIZE and len(final_df) > Config.SAMPLE_SIZE:
+        print(f"⏳ Sampling {Config.SAMPLE_SIZE:,} rows...")
+        final_df = final_df.sample(n=Config.SAMPLE_SIZE, random_state=Config.RANDOM_STATE)
+        print(f"✓ Sampled to {len(final_df):,} rows")
 
-        print("\n⏳ Building feature list...")
-        final_feature_list = (
-                Config.BASE_NUMERICAL_FEATURES +
-                [f'{c}_was_missing' for c in Config.BASE_NUMERICAL_FEATURES] +
-                Config.CATEGORICAL_LABEL_ENCODE +
-                Config.ENGINEERED_FEATURES +
-                [f'orig_{c}' for c in Config.IP_FEATURES_BASE] +
-                [f'resp_{c}' for c in Config.IP_FEATURES_BASE]
-        )
+    print("\n⏳ Saving Parquet...")
+    final_df.to_parquet(Config.ENGINEERED_DATA_PATH, compression='snappy', index=False)
+    parquet_size = os.path.getsize(Config.ENGINEERED_DATA_PATH) / (1024 * 1024)
+    print(f"✓ Parquet saved | {parquet_size:.1f} MB")
 
-        first_row = ddf.head(1)
-        one_hot_cols = [c for c in first_row.columns if
-                        any(c.startswith(p + '_') for p in Config.CATEGORICAL_ONE_HOT_ENCODE)]
-        final_feature_list.extend(one_hot_cols)
+    print("\n⏳ Saving CSV...")
+    final_df.to_csv(Config.ENGINEERED_DATA_PATH_CSV, index=False)
+    print("✓ CSV saved")
 
-        target_cols = [Config.TARGET_COL, Config.DETAILED_TARGET_COL,
-                       Config.FAMILY_TARGET_COL, 'attack_subtype']
+    # Save feature list
+    final_feature_list = [col for col in final_df.columns if
+                          col not in [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL,
+                                      'attack_subtype']]
+    joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
+    print(f"✓ Feature list saved ({len(final_feature_list)} features)")
 
-        for col in final_feature_list + target_cols:
-            if col not in ddf.columns:
-                ddf[col] = 0 if col in final_feature_list else 'Unknown'
+    stage2_time = time.time() - stage2_start
+    total_time = time.time() - overall_start
 
-        final_ddf = ddf[final_feature_list + target_cols]
-
-        print("\n⏳ Saving Parquet (streaming)...")
-        t_parquet_start = time.time()
-
-        final_ddf.to_parquet(
-            Config.ENGINEERED_DATA_PATH,
-            compression='snappy',
-            engine='pyarrow',
-            write_index=False
-        )
-
-        t_parquet = time.time() - t_parquet_start
-        parquet_size = os.path.getsize(Config.ENGINEERED_DATA_PATH) / (1024 * 1024)
-        print(f"✓ Parquet saved ({t_parquet:.2f}s) | {parquet_size:.1f} MB")
-
-        print("\n⏳ Saving CSV...")
-        ddf_csv = dd.read_parquet(Config.ENGINEERED_DATA_PATH)
-        ddf_csv.to_csv(Config.ENGINEERED_DATA_PATH_CSV, single_file=True, index=False)
-        print("✓ CSV saved")
-
-        joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
-        print(f"✓ Feature list saved")
-
-        stage2_time = time.time() - stage2_start
-        total_time = time.time() - overall_start
-
-        print("\n" + "=" * 70)
-        print("🎉 PIPELINE COMPLETE")
-        print("=" * 70)
-        print(f"⏱️  Stage 1: {stage1_time:.2f}s ({stage1_time / 60:.1f} min)")
-        print(f"⏱️  Stage 2: {stage2_time:.2f}s ({stage2_time / 60:.1f} min)")
-        print(f"⏱️  Total: {total_time:.2f}s ({total_time / 60:.1f} min)")
-        print(f"📊 Features: {len(final_feature_list)}")
-        print("=" * 70)
-
-    except Exception as e:
-        print(f"\n❌ Stage 2 failed: {e}")
-        import traceback
-        traceback.print_exc()
+    print("\n" + "=" * 70)
+    print("🎉 PIPELINE COMPLETE")
+    print("=" * 70)
+    print(f"⏱️  Stage 1: {stage1_time:.2f}s ({stage1_time / 60:.1f} min)")
+    print(f"⏱️  Stage 2: {stage2_time:.2f}s ({stage2_time / 60:.1f} min)")
+    print(f"⏱️  Total: {total_time:.2f}s ({total_time / 60:.1f} min)")
+    print(f"📊 Final rows: {len(final_df):,}")
+    print(f"📊 Features: {len(final_feature_list)}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
