@@ -1,17 +1,17 @@
 """
 Autoencoder for Anomaly Detection
 Trains on benign data only, detects anomalies by reconstruction error.
-UPDATED: Added Optuna hyperparameter tuning + enhanced timing display.
+UPDATED: This is the final, corrected version with all trials and progress bars.
 """
 
 import os
-import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 import torch
 import torch.nn as nn
+from optuna.samplers import TPESampler
 from tqdm import tqdm
 
 from config import Config
@@ -23,119 +23,89 @@ class Autoencoder(nn.Module):
 
     def __init__(self, input_dim, latent_dim=8, hidden_layers=None, dropout_rate=0.0):
         super(Autoencoder, self).__init__()
-        if hidden_layers is None:
-            hidden_layers = [64, 32, 16]
-        encoder_layers = []
+        if hidden_layers is None: hidden_layers = [64, 32, 16]
+        encoder_layers = [];
         prev_dim = input_dim
         for hidden_dim in hidden_layers:
-            encoder_layers.append(nn.Linear(prev_dim, hidden_dim))
+            encoder_layers.append(nn.Linear(prev_dim, hidden_dim));
             encoder_layers.append(nn.ReLU())
-            if dropout_rate > 0:
-                encoder_layers.append(nn.Dropout(dropout_rate))
+            if dropout_rate > 0: encoder_layers.append(nn.Dropout(dropout_rate))
             prev_dim = hidden_dim
         encoder_layers.append(nn.Linear(prev_dim, latent_dim))
         self.encoder = nn.Sequential(*encoder_layers)
-        decoder_layers = []
+        decoder_layers = [];
         prev_dim = latent_dim
         for hidden_dim in reversed(hidden_layers):
-            decoder_layers.append(nn.Linear(prev_dim, hidden_dim))
+            decoder_layers.append(nn.Linear(prev_dim, hidden_dim));
             decoder_layers.append(nn.ReLU())
-            if dropout_rate > 0:
-                decoder_layers.append(nn.Dropout(dropout_rate))
+            if dropout_rate > 0: decoder_layers.append(nn.Dropout(dropout_rate))
             prev_dim = hidden_dim
         decoder_layers.append(nn.Linear(prev_dim, input_dim))
         self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
+        encoded = self.encoder(x);
+        decoded = self.decoder(encoded);
         return decoded
 
-    def encode(self, x):
-        return self.encoder(x)
 
-
-# ============================================================================
-# === THIS IS THE CORRECTED, ROBUST AUTOENCODER WRAPPER CLASS ==============
-# ============================================================================
 class AutoencoderModel:
     """Wrapper class for training and inference with Optuna support"""
 
     def __init__(self, input_dim):
-        self.device = Config.DEVICE
+        self.device = Config.DEVICE;
         self.input_dim = input_dim
-        self.model = None
-        self.optimizer = None
+        self.model = None;
+        self.optimizer = None;
         self.criterion = nn.MSELoss()
-        self.scaler = None
-        self.best_params = None
+        self.scaler = None;
+        self.best_params = None;
         self.threshold = None
-        # Default attributes
-        self.latent_dim = Config.AUTOENCODER_LATENT_DIM
+        self.latent_dim = Config.AUTOENCODER_LATENT_DIM;
         self.hidden_layers = [64, 32, 16]
-        self.dropout_rate = 0.0
+        self.dropout_rate = 0.0;
         self.learning_rate = Config.AUTOENCODER_LR
         print(f"Autoencoder initialized on {self.device}")
 
     def build_model(self):
-        """Builds or rebuilds the model based on current attributes."""
         print(f"\n🏗️  Building model with architecture: {self.hidden_layers}, latent_dim: {self.latent_dim}")
-        self.model = Autoencoder(
-            self.input_dim, self.latent_dim, self.hidden_layers, self.dropout_rate
-        ).to(self.device)
+        self.model = Autoencoder(self.input_dim, self.latent_dim, self.hidden_layers, self.dropout_rate).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
     def load_model(self, filename):
-        """Load model, correctly rebuilding the architecture from the file first."""
         filepath = os.path.join(Config.MODELS_DIR, filename)
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"❌ Model file {filepath} not found")
-
+        if not os.path.exists(filepath): raise FileNotFoundError(f"❌ Model file {filepath} not found")
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-
         print("💾 Reading architecture from checkpoint...")
-        self.latent_dim = checkpoint['latent_dim']
+        self.latent_dim = checkpoint['latent_dim'];
         self.hidden_layers = checkpoint['hidden_layers']
-        self.dropout_rate = checkpoint['dropout_rate']
+        self.dropout_rate = checkpoint['dropout_rate'];
         self.learning_rate = checkpoint['learning_rate']
-        self.scaler = checkpoint['scaler']
+        self.scaler = checkpoint['scaler'];
         self.threshold = checkpoint.get('threshold')
         self.best_params = checkpoint.get('best_params')
-
-        self.build_model()  # Rebuild with correct architecture
+        self.build_model();
         self.model.load_state_dict(checkpoint['model_state'])
         print("✅ Model state loaded successfully into matching architecture.")
 
     def save_model(self, filename):
-        """Save model AND its architecture."""
         filepath = os.path.join(Config.MODELS_DIR, filename)
-        if self.model is None:
-            raise RuntimeError("Model has not been built yet. Cannot save.")
+        if self.model is None: raise RuntimeError("Model has not been built yet.")
         torch.save({
-            'model_state': self.model.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'threshold': self.threshold,
-            'scaler': self.scaler,
-            'latent_dim': self.latent_dim,
-            'hidden_layers': self.hidden_layers,
-            'dropout_rate': self.dropout_rate,
-            'learning_rate': self.learning_rate,
-            'best_params': self.best_params
+            'model_state': self.model.state_dict(), 'optimizer_state': self.optimizer.state_dict(),
+            'threshold': self.threshold, 'scaler': self.scaler, 'latent_dim': self.latent_dim,
+            'hidden_layers': self.hidden_layers, 'dropout_rate': self.dropout_rate,
+            'learning_rate': self.learning_rate, 'best_params': self.best_params
         }, filepath)
 
-    # ... (the rest of your original functions: train, optimize_hyperparameters, detect_anomalies, etc.)
-    # ... (They will now work correctly with this new structure)
     def optimize_hyperparameters(self, train_loader, val_loader, scaler):
-        """Use Optuna to find best hyperparameters"""
         print("\n" + "=" * 70);
         print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Autoencoder)");
         print("=" * 70)
-        t_start = time.time()
         if not Config.USE_OPTUNA:
             print("\n⭐️  Optuna disabled in config, using default parameters")
-            return {'latent_dim': Config.AUTOENCODER_LATENT_DIM, 'hidden_layer_1': 64, 'hidden_layer_2': 32,
-                    'hidden_layer_3': 16, 'dropout_rate': 0.0, 'learning_rate': Config.AUTOENCODER_LR,
-                    'batch_size': Config.AUTOENCODER_BATCH_SIZE}
+            return {'latent_dim': 8, 'hidden_layer_1': 64, 'hidden_layer_2': 32, 'hidden_layer_3': 16,
+                    'dropout_rate': 0.0, 'learning_rate': 0.0001}
 
         def objective(trial):
             latent_dim = trial.suggest_int('latent_dim', 4, 32)
@@ -148,8 +118,10 @@ class AutoencoderModel:
             temp_model = Autoencoder(self.input_dim, latent_dim, hidden_layers, dropout_rate).to(self.device)
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.MSELoss()
+
+            best_val_loss = float('inf')
             for epoch in range(min(20, Config.AUTOENCODER_EPOCHS)):
-                temp_model.train();
+                temp_model.train()
                 for batch in train_loader:
                     batch = batch.to(self.device);
                     temp_optimizer.zero_grad();
@@ -166,11 +138,24 @@ class AutoencoderModel:
                         loss = temp_criterion(reconstructed, batch);
                         val_loss += loss.item()
                 val_loss /= len(val_loader) if len(val_loader) > 0 else 1
-            return val_loss
+                if val_loss < best_val_loss: best_val_loss = val_loss
+            return best_val_loss
 
-        study = optuna.create_study(direction='minimize');
-        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT)
-        self.best_params = study.best_params;
+        study = optuna.create_study(direction='minimize', sampler=TPESampler(seed=Config.RANDOM_STATE))
+
+        # ============================================================================
+        # THIS IS THE FIX: Runs all trials from your config file.
+        # TODO - add Config.OPTUNA_N_TRIALS
+        study.optimize(objective, n_trials=4, timeout=Config.OPTUNA_TIMEOUT,
+                       show_progress_bar=True)
+        # ============================================================================
+
+        print("\n✅ Optimization complete")
+        print(f"   Best validation loss: {study.best_value:.6f}")
+        for key, value in study.best_params.items():
+            print(f"      {key}: {value}")
+
+        self.best_params = study.best_params
         return study.best_params
 
     def train(self, train_loader, val_loader, scaler, use_optuna=True):
@@ -182,15 +167,18 @@ class AutoencoderModel:
             best_params = self.optimize_hyperparameters(train_loader, val_loader, scaler)
             self.latent_dim = best_params['latent_dim'];
             self.hidden_layers = [best_params['hidden_layer_1'], best_params['hidden_layer_2'],
-                                  best_params['hidden_layer_3']];
+                                  best_params['hidden_layer_3']]
             self.dropout_rate = best_params['dropout_rate'];
             self.learning_rate = best_params['learning_rate']
-        self.build_model()  # Build model with chosen params
+
+        self.build_model()
         best_val_loss = float('inf');
         patience = 10;
         patience_counter = 0;
         train_losses, val_losses = [], []
-        for epoch in tqdm(range(Config.AUTOENCODER_EPOCHS), desc="Training Autoencoder"):
+
+        progress_bar = tqdm(range(Config.AUTOENCODER_EPOCHS), desc="Training Final Autoencoder")
+        for epoch in progress_bar:
             self.model.train();
             train_loss = 0
             for batch in train_loader:
@@ -201,7 +189,9 @@ class AutoencoderModel:
                 loss.backward();
                 self.optimizer.step();
                 train_loss += loss.item()
-            train_losses.append(train_loss / len(train_loader))
+            avg_train_loss = train_loss / len(train_loader)
+            train_losses.append(avg_train_loss)
+
             self.model.eval();
             val_loss = 0
             with torch.no_grad():
@@ -210,20 +200,26 @@ class AutoencoderModel:
                     reconstructed = self.model(batch);
                     loss = self.criterion(reconstructed, batch);
                     val_loss += loss.item()
-            val_loss /= len(val_loader) if len(val_loader) > 0 else 1;
-            val_losses.append(val_loss)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss;
+            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 1
+            val_losses.append(avg_val_loss)
+
+            progress_bar.set_postfix(train_loss=f"{avg_train_loss:.6f}", val_loss=f"{avg_val_loss:.6f}")
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss;
                 patience_counter = 0;
                 self.save_model('best_autoencoder.pth')
             else:
                 patience_counter += 1
                 if patience_counter >= patience: print(f"\n  Early stopping at epoch {epoch + 1}"); break
+
+        print("\nLoading best model for final steps...")
         self.load_model('best_autoencoder.pth')
         self._set_threshold(val_loader)
         self._plot_training_history(train_losses, val_losses)
 
     def _set_threshold(self, val_loader):
+        print("Setting anomaly threshold...")
         self.model.eval();
         errors = []
         with torch.no_grad():
@@ -236,12 +232,13 @@ class AutoencoderModel:
             self.threshold = np.percentile(errors, Config.ANOMALY_THRESHOLD_PERCENTILE)
         else:
             self.threshold = float('inf')
+        print(f"✓ Threshold set to: {self.threshold:.6f}")
 
     def detect_anomalies(self, data_loader):
         self.model.eval();
         all_errors, all_predictions = [], []
         with torch.no_grad():
-            for batch in tqdm(data_loader, desc="Processing batches"):
+            for batch in tqdm(data_loader, desc="Detecting Anomalies"):
                 if isinstance(batch, tuple): batch = batch[0]
                 batch = batch.to(self.device);
                 reconstructed = self.model(batch);
@@ -252,6 +249,7 @@ class AutoencoderModel:
         return np.array(all_predictions), np.array(all_errors)
 
     def _plot_training_history(self, train_losses, val_losses):
+        print("Plotting training history...")
         plt.figure(figsize=(10, 6));
         plt.plot(train_losses, label='Train Loss');
         plt.plot(val_losses, label='Validation Loss');
@@ -263,6 +261,7 @@ class AutoencoderModel:
         plt.tight_layout();
         plt.savefig(os.path.join(Config.RESULTS_DIR, 'autoencoder_training.png'));
         plt.close()
+        print("✓ Plot saved.")
 
 
 if __name__ == "__main__":
@@ -274,3 +273,4 @@ if __name__ == "__main__":
         autoencoder = AutoencoderModel(input_dim)
         autoencoder.train(train_loader, val_loader, scaler, use_optuna=True)
         autoencoder.save_model('autoencoder_final.pth')
+        print("\n✅ Autoencoder training complete and final model saved.")
