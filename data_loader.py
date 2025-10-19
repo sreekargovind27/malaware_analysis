@@ -271,7 +271,7 @@ def get_data_for_multiclass():
     print("🎯 PERFORMING CLASS-AWARE UNDERSAMPLING")
     print("=" * 70)
 
-    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.30)
+    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.03)
     MINORITY_CLASS_THRESHOLD = 100000
 
     print(f"   Original dataset size: {len(df_filtered):,} rows")
