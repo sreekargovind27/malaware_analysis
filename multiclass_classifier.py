@@ -21,7 +21,7 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader, TensorDataset # Use TensorDataset
+from torch.utils.data import DataLoader, TensorDataset  # Use TensorDataset
 from tqdm import tqdm
 
 from config import Config
@@ -137,7 +137,8 @@ class MultiClassXGBoost:
                      'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True), 'n_jobs': Config.N_JOBS,
                      'random_state': Config.RANDOM_STATE, 'eval_metric': 'mlogloss'}
 
-            print(f"  - Params: n_estimators={param['n_estimators']}, max_depth={param['max_depth']}, lr={param['learning_rate']:.4f}")
+            print(
+                f"  - Params: n_estimators={param['n_estimators']}, max_depth={param['max_depth']}, lr={param['learning_rate']:.4f}")
             print("  - Training model...")
 
             model = xgb.XGBClassifier(**param)
@@ -294,7 +295,6 @@ class MultiClassNeuralNetModel:
         self.input_dim = input_dim
         self.num_classes = num_classes
 
-        # Use provided params or defaults
         self.hidden_layers = hidden_layers or [128, 64, 32]
         self.dropout_rate = dropout_rate if dropout_rate is not None else 0.3
         self.learning_rate = learning_rate or 0.001
@@ -306,14 +306,14 @@ class MultiClassNeuralNetModel:
         ).to(self.device)
 
         if self.device != 'cpu':
-            print("⏳ Warming up CUDA context and compiling kernels...")
+            print("⏳ Warming up CUDA context...")
             try:
-                dummy_input = torch.randn(256, input_dim, device=self.device)
+                dummy_input = torch.randn(2, input_dim, device=self.device)
                 _ = self.model(dummy_input)
                 torch.cuda.synchronize()
                 print("✓ CUDA warmup complete.")
             except Exception as e:
-                print(f"⚠️ CUDA Warmup failed: {e}. Proceeding without warmup.")
+                print(f"⚠️ CUDA Warmup failed: {e}.")
 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
@@ -327,24 +327,87 @@ class MultiClassNeuralNetModel:
         print(f"  Learning rate: {self.learning_rate}")
         print(f"  Batch normalization: {self.use_batch_norm}")
 
+    def _objective(self, trial, X_train_gpu, y_train_gpu, X_val_gpu, y_val_gpu):
+        print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
+
+        # Suggest parameters
+        n_layers = trial.suggest_int('n_layers', 2, 4)
+        hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
+        dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
+        use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
+        learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384, 32768, 65536])
+
+        print(
+            f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
+
+        # Create model and components
+        temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
+                                         use_batch_norm).to(self.device)
+        temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
+        temp_criterion = nn.CrossEntropyLoss()
+
+        # Create DataLoaders
+        train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
+
+        num_epochs = 40
+        best_val_acc = 0
+        patience_counter = 0
+
+        for epoch in range(num_epochs):
+            # Training loop
+            temp_model.train()
+            for X_batch, y_batch in train_loader:
+                temp_optimizer.zero_grad()
+                outputs = temp_model(X_batch)
+                loss = temp_criterion(outputs, y_batch)
+                loss.backward()
+                temp_optimizer.step()
+
+            # Validation loop
+            temp_model.eval()
+            val_correct, val_total = 0, 0
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    outputs = temp_model(X_batch)
+                    _, predicted = torch.max(outputs, 1)
+                    val_total += y_batch.size(0)
+                    val_correct += (predicted == y_batch).sum().item()
+
+            val_acc = val_correct / val_total
+            print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
+
+            # Early stopping and Optuna reporting
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= 5:
+                    print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
+                    break
+
+            trial.report(val_acc, epoch)
+            if trial.should_prune():
+                print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
+                raise optuna.TrialPruned()
+
+        print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
+        return best_val_acc
+
     def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
         """Use Optuna to find best hyperparameters for Neural Network"""
         print("\n" + "=" * 70)
         print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Neural Network)")
         print("=" * 70)
-
-        t_start = time.time()  # Define t_start at the beginning of the method.
+        t_start = time.time()
 
         if not Config.USE_OPTUNA:
             print("\n⏭️  Optuna disabled in config, using default parameters")
             return {
-                'n_layers': 3,
-                'layer_1': 128,
-                'layer_2': 64,
-                'layer_3': 32,
-                'dropout_rate': 0.3,
-                'learning_rate': 0.001,
-                'batch_size': 4096,
+                'n_layers': 3, 'layer_1': 128, 'layer_2': 64, 'layer_3': 32,
+                'dropout_rate': 0.3, 'learning_rate': 0.001, 'batch_size': 4096,
                 'use_batch_norm': True
             }
 
@@ -369,134 +432,16 @@ class MultiClassNeuralNetModel:
         del X_train_scaled, X_val_scaled, X_train_shuffled, y_train_shuffled, perm
         print("   ✓ Optuna data is on GPU and pre-shuffled.")
 
-        def objective(trial):
-            # ======================================================================
-            # HYPER-VERBOSE DEBUGGING - START
-            # ======================================================================
-            print(f"\n--- [NN] Starting Optuna Trial {trial.number} at {time.strftime('%H:%M:%S')} ---")
-
-            print("  [1/8] Suggesting parameters...")
-            n_layers = trial.suggest_int('n_layers', 2, 4)
-            # Use GPU-friendly layer sizes
-            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
-            dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
-            use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
-            learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-            # Use larger batch sizes
-            batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384, 32768, 65536])
-            print("  [2/8] ✓ Parameters suggested.")
-            print(
-                f"      - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
-
-            print("  [3/8] Creating model, optimizer, criterion...")
-            temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
-                                             use_batch_norm).to(self.device)
-            temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
-            temp_criterion = nn.CrossEntropyLoss()
-            print("  [4/8] ✓ Model components created.")
-
-            print("  [5/8] Creating DataLoaders...")
-            train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
-            val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
-            print("  [6/8] ✓ DataLoaders created. Starting training loop.")
-
-            num_epochs = 40  # Increased number of epochs
-            best_val_acc = 0
-            patience_counter = 0
-
-            try:
-                for epoch in range(num_epochs):
-                    epoch_start_time = time.time()
-                    print(f"    [Epoch {epoch + 1}/{num_epochs}] Starting...")
-
-                    temp_model.train()
-                    # Loop through training data
-                    for i, (X_batch, y_batch) in enumerate(train_loader):
-                        # For the first 5 batches, print detailed timing
-                        if i < 5:
-                            print(f"\n      --- Batch {i} ---")
-                            torch.cuda.synchronize();
-                            t0 = time.time()
-
-                            temp_optimizer.zero_grad()
-                            torch.cuda.synchronize();
-                            t1 = time.time()
-                            if i < 5: print(f"      zero_grad:  {t1 - t0:.6f}s")
-
-                            outputs = temp_model(X_batch)
-                            torch.cuda.synchronize();
-                            t2 = time.time()
-                            if i < 5: print(f"      forward:    {t2 - t1:.6f}s")
-
-                            loss = temp_criterion(outputs, y_batch)
-                            torch.cuda.synchronize();
-                            t3 = time.time()
-                            if i < 5: print(f"      loss_calc:  {t3 - t2:.6f}s")
-
-                            loss.backward()
-                            torch.cuda.synchronize();
-                            t4 = time.time()
-                            if i < 5: print(f"      backward:   {t4 - t3:.6f}s")
-
-                            temp_optimizer.step()
-                            torch.cuda.synchronize();
-                            t5 = time.time()
-                            if i < 5: print(f"      step:       {t5 - t4:.6f}s")
-                        else:
-                            # After the first 5 batches, run without timing for speed
-                            temp_optimizer.zero_grad()
-                            outputs = temp_model(X_batch)
-                            loss = temp_criterion(outputs, y_batch)
-                            loss.backward()
-                            temp_optimizer.step()
-
-                    print(f"      - Training for epoch {epoch + 1} complete.")
-
-                    print(f"      - Starting validation...")
-                    temp_model.eval()
-                    val_correct, val_total = 0, 0
-                    with torch.no_grad():
-                        for (X_batch, y_batch) in val_loader:
-                            outputs = temp_model(X_batch)
-                            _, predicted = torch.max(outputs, 1)
-                            val_total += y_batch.size(0)
-                            val_correct += (predicted == y_batch).sum().item()
-
-                    val_acc = val_correct / val_total
-                    epoch_time = time.time() - epoch_start_time
-                    print(f"    [Epoch {epoch + 1}/{num_epochs}] Finished in {epoch_time:.2f}s. Val Acc: {val_acc:.4f}")
-
-                    if val_acc > best_val_acc:
-                        best_val_acc = val_acc
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-                        if patience_counter >= 5:
-                            print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
-                            break
-
-                    trial.report(val_acc, epoch)
-                    if trial.should_prune():
-                        print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
-                        raise optuna.TrialPruned()
-
-            except Exception as e:
-                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                print(f"!!!!!!!!!!!!!! CRITICAL ERROR !!!!!!!!!!!!!!!")
-                import traceback
-                traceback.print_exc()
-                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                raise e
-
-            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
-            return best_val_acc
-            # ======================================================================
-            # HYPER-VERBOSE DEBUGGING - END
-            # ======================================================================
-
         sampler = TPESampler(seed=Config.RANDOM_STATE)
         study = optuna.create_study(direction='maximize', sampler=sampler, pruner=optuna.pruners.MedianPruner())
-        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT, show_progress_bar=True)
+
+        study.optimize(
+            lambda trial: self._objective(trial, X_train_gpu, y_train_gpu, X_val_gpu, y_val_gpu),
+            n_trials=Config.OPTUNA_N_TRIALS,
+            timeout=Config.OPTUNA_TIMEOUT,
+            show_progress_bar=True
+        )
+
         t_elapsed = time.time() - t_start
 
         print(f"\n✅ Optimization complete")
@@ -514,14 +459,13 @@ class MultiClassNeuralNetModel:
         print("\n" + "=" * 70)
         print("🚀 TRAINING NEURAL NETWORK MULTI-CLASS")
         print("=" * 70)
-
         overall_start = time.time()
 
         if use_optuna and Config.USE_OPTUNA:
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
 
             n_layers = best_params['n_layers']
-            self.hidden_layers = [best_params[f'layer_{i+1}'] for i in range(n_layers)]
+            self.hidden_layers = [best_params[f'layer_{i + 1}'] for i in range(n_layers)]
             self.dropout_rate = best_params['dropout_rate']
             self.learning_rate = best_params['learning_rate']
             self.use_batch_norm = best_params['use_batch_norm']
@@ -535,7 +479,6 @@ class MultiClassNeuralNetModel:
                 self.input_dim, self.num_classes, self.hidden_layers,
                 self.dropout_rate, self.use_batch_norm
             ).to(self.device)
-
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         else:
             batch_size = 4096
@@ -547,12 +490,10 @@ class MultiClassNeuralNetModel:
         print(f"✓ Class weights calculated")
 
         print(f"\n⏳ Scaling features...")
-        t_scale_start = time.time()
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_val_scaled = self.scaler.transform(X_val)
-        t_scale = time.time() - t_scale_start
-        print(f"✓ Scaling complete ({t_scale:.2f}s)")
+        print(f"✓ Scaling complete.")
 
         print(f"⏳ Pre-shuffling and moving final training data to GPU...")
         perm = torch.randperm(len(X_train_scaled))
@@ -571,12 +512,13 @@ class MultiClassNeuralNetModel:
         print(f"✓ DataLoaders created")
 
         print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
+
         t_train_start = time.time()
 
         best_val_acc = 0
         patience_counter = 0
-
         progress_bar = tqdm(range(50), desc="Training")
+
         for epoch in progress_bar:
             self.model.train()
             total_train_loss = 0
@@ -587,7 +529,6 @@ class MultiClassNeuralNetModel:
                 loss.backward()
                 self.optimizer.step()
                 total_train_loss += loss.item()
-
             avg_train_loss = total_train_loss / len(train_loader)
 
             self.model.eval()
@@ -600,15 +541,12 @@ class MultiClassNeuralNetModel:
                     _, predicted = torch.max(outputs, 1)
                     val_total += y_batch.size(0)
                     val_correct += (predicted == y_batch).sum().item()
-
             val_acc = val_correct / val_total
             avg_val_loss = total_val_loss / len(val_loader)
 
             progress_bar.set_postfix({
-                'Train Loss': f'{avg_train_loss:.4f}',
-                'Val Loss': f'{avg_val_loss:.4f}',
-                'Val Acc': f'{val_acc:.4f}',
-                'Best Acc': f'{best_val_acc:.4f}'
+                'Train Loss': f'{avg_train_loss:.4f}', 'Val Loss': f'{avg_val_loss:.4f}',
+                'Val Acc': f'{val_acc:.4f}', 'Best Acc': f'{best_val_acc:.4f}'
             })
 
             if val_acc > best_val_acc:
@@ -622,6 +560,7 @@ class MultiClassNeuralNetModel:
                     break
 
         self.load_model('best_multiclass_nn.pth')
+
         t_train = time.time() - t_train_start
         total_time = time.time() - overall_start
 

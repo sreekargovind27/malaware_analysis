@@ -29,12 +29,16 @@ def scan_single_file(file_path):
     proto_values, conn_state_values = set(), set()
     try:
         # Added comment='#' to handle files that might have commented header lines
-        df_sample = pd.read_csv(file_path, usecols=['proto', 'conn_state'], low_memory=False, on_bad_lines='skip', comment='#')
-        proto_values.update(df_sample['proto'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
-        conn_state_values.update(df_sample['conn_state'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
+        df_sample = pd.read_csv(file_path, usecols=['proto', 'conn_state'], low_memory=False, on_bad_lines='skip',
+                                comment='#')
+        proto_values.update(
+            df_sample['proto'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
+        conn_state_values.update(
+            df_sample['conn_state'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
     except Exception as e:
         print(f"  Warning: Could not scan {os.path.basename(file_path)}: {e}")
     return proto_values, conn_state_values
+
 
 # ============================================================================
 # THIS FUNCTION WAS MISSING. IT HAS BEEN ADDED BACK.
@@ -57,6 +61,8 @@ def scan_categorical_values(csv_files):
     print(f"   Found {len(all_proto_values)} unique proto values")
     print(f"   Found {len(all_conn_state_values)} unique conn_state values")
     return {'proto': sorted(all_proto_values), 'conn_state': sorted(all_conn_state_values)}
+
+
 # ============================================================================
 # END OF ADDED FUNCTION
 # ============================================================================
@@ -72,6 +78,7 @@ def process_single_csv(args):
 
 def extract_ip_features(ip_series):
     """Extract features from IP addresses."""
+
     def parse_ip(ip_str):
         if pd.isna(ip_str) or ip_str in ['-', ''] or ':' in str(ip_str): return [0, 0, 0, 0, 0]
         try:
@@ -83,7 +90,9 @@ def extract_ip_features(ip_series):
             is_multicast = 1 if 224 <= first <= 239 else 0
             is_localhost = 1 if first == 127 else 0
             return [is_private, is_broadcast, is_multicast, first, is_localhost]
-        except (ValueError, IndexError): return [0, 0, 0, 0, 0]
+        except (ValueError, IndexError):
+            return [0, 0, 0, 0, 0]
+
     ip_features = ip_series.apply(parse_ip)
     return pd.DataFrame(ip_features.tolist(), columns=Config.IP_FEATURES_BASE, index=ip_series.index)
 
@@ -92,7 +101,8 @@ def _clean_and_expand_labels(df):
     """Clean and expand label columns."""
     has_label_col = 'label' in df.columns and 'detailed-label' in df.columns
     if has_label_col:
-        combined_str = (df['label'].astype(str).fillna('') + ' ' + df['detailed-label'].astype(str).fillna('')).str.lower().str.strip()
+        combined_str = (df['label'].astype(str).fillna('') + ' ' + df['detailed-label'].astype(str).fillna(
+            '')).str.lower().str.strip()
     else:
         combined_str = pd.Series([''] * len(df))
 
@@ -108,7 +118,12 @@ def _clean_and_expand_labels(df):
         return df
 
     malicious_labels = combined_str[malicious_mask]
-    patterns = {'attack_type': {'C&C': re.compile(r'c&c'), 'DDoS': re.compile(r'ddos'), 'PortScan': re.compile(r'partofahorizontalportscan|portscan'), 'Attack': re.compile(r'attack'), 'FileDownload': re.compile(r'filedownload')}, 'malware_family': {'Mirai': re.compile(r'mirai'), 'Okiru': re.compile(r'okiru'), 'Torii': re.compile(r'torii')}, 'attack_subtype': {'HeartBeat': re.compile(r'heartbeat'), 'FileDownload': re.compile(r'filedownload')}}
+    patterns = {'attack_type': {'C&C': re.compile(r'c&c'), 'DDoS': re.compile(r'ddos'),
+                                'PortScan': re.compile(r'partofahorizontalportscan|portscan'),
+                                'Attack': re.compile(r'attack'), 'FileDownload': re.compile(r'filedownload')},
+                'malware_family': {'Mirai': re.compile(r'mirai'), 'Okiru': re.compile(r'okiru'),
+                                   'Torii': re.compile(r'torii')},
+                'attack_subtype': {'HeartBeat': re.compile(r'heartbeat'), 'FileDownload': re.compile(r'filedownload')}}
 
     def parse_label(label_str):
         label_str = re.sub(r'\(empty\)|-|\bmalicious\b|\bbenign\b', '', label_str).strip()
@@ -117,12 +132,18 @@ def _clean_and_expand_labels(df):
             for key, pattern in cat_patterns.items():
                 if pattern.search(label_str): parsed[category].add(key)
         primary_type = 'Unknown'
-        if parsed['malware_family']: primary_type = list(parsed['malware_family'])[0]
-        elif 'PortScan' in parsed['attack_type']: primary_type = 'PortScan'
-        elif 'C&C' in parsed['attack_type']: primary_type = 'C&C'
-        elif 'DDoS' in parsed['attack_type']: primary_type = 'DDoS'
-        elif 'FileDownload' in parsed['attack_type']: primary_type = 'FileDownload'
-        elif 'Attack' in parsed['attack_type']: primary_type = 'Attack'
+        if parsed['malware_family']:
+            primary_type = list(parsed['malware_family'])[0]
+        elif 'PortScan' in parsed['attack_type']:
+            primary_type = 'PortScan'
+        elif 'C&C' in parsed['attack_type']:
+            primary_type = 'C&C'
+        elif 'DDoS' in parsed['attack_type']:
+            primary_type = 'DDoS'
+        elif 'FileDownload' in parsed['attack_type']:
+            primary_type = 'FileDownload'
+        elif 'Attack' in parsed['attack_type']:
+            primary_type = 'Attack'
         subtype = ','.join(sorted(list(parsed['attack_subtype']))) if parsed['attack_subtype'] else pd.NA
         family = list(parsed['malware_family'])[0] if parsed['malware_family'] else pd.NA
         if primary_type == 'Unknown' and label_str: primary_type = label_str.replace(' ', '').title()
@@ -138,7 +159,8 @@ def _clean_and_expand_labels(df):
 
 def _preprocess_partition(df, all_categorical_values):
     """Preprocess a single partition."""
-    METADATA_COLUMNS = ['Source_Folder', 'ts', 'uid', 'id.orig_h', 'id.orig_p', 'id.resp_h', 'id.resp_p', 'label', 'detailed-label']
+    METADATA_COLUMNS = ['Source_Folder', 'ts', 'uid', 'id.orig_h', 'id.orig_p', 'id.resp_h', 'id.resp_p', 'label',
+                        'detailed-label']
     ip_columns_to_keep = ['id.orig_h', 'id.resp_h', 'id.resp_p']
     if 'label' in df.columns and 'detailed-label' in df.columns: df = _clean_and_expand_labels(df)
 
@@ -154,7 +176,9 @@ def _preprocess_partition(df, all_categorical_values):
 
     for col in Config.BASE_NUMERICAL_FEATURES:
         if col not in df.columns:
-            df[col] = 0; df[f'{col}_was_missing'] = 1; continue
+            df[col] = 0;
+            df[f'{col}_was_missing'] = 1;
+            continue
         df[f'{col}_was_missing'] = df[col].isna().astype(np.int8)
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).clip(lower=0)
         if col in Config.SKEWED_NUMERICAL_FEATURES: df[col] = np.log1p(df[col])
@@ -165,21 +189,32 @@ def _preprocess_partition(df, all_categorical_values):
     for col in Config.CATEGORICAL_ONE_HOT_ENCODE:
         if col not in df.columns: continue
         df[col] = df[col].fillna('unknown').astype(str).replace(['', '-', 'nan', 'None'], 'unknown')
-        for category in all_categorical_values.get(col, []): df[f'{col}_{category}'] = (df[col] == category).astype(np.int8)
+        for category in all_categorical_values.get(col, []): df[f'{col}_{category}'] = (df[col] == category).astype(
+            np.int8)
         df = df.drop(columns=[col])
-    df['is_port_23'] = (df['id.resp_p'] == 23).astype(np.int8); df['is_port_22'] = (df['id.resp_p'] == 22).astype(np.int8)
-    df['is_S0_state'] = df.get('conn_state_S0', 0); df['is_telnet'] = 0; df['is_unknown_service'] = 0
-    total_bytes = df['orig_bytes'] + df['resp_bytes']; total_packets = df['orig_pkts'] + df['resp_pkts']
-    df['upload_ratio'] = df['orig_bytes'] / (total_bytes + 1e-9); df['bytes_per_packet'] = total_bytes / (total_packets + 1e-9)
-    safe_duration = np.expm1(df['duration']).clip(lower=0.001); df['packet_rate'] = (total_packets / safe_duration).clip(upper=10000)
+    df['is_port_23'] = (df['id.resp_p'] == 23).astype(np.int8);
+    df['is_port_22'] = (df['id.resp_p'] == 22).astype(np.int8)
+    df['is_S0_state'] = df.get('conn_state_S0', 0);
+    df['is_telnet'] = 0;
+    df['is_unknown_service'] = 0
+    total_bytes = df['orig_bytes'] + df['resp_bytes'];
+    total_packets = df['orig_pkts'] + df['resp_pkts']
+    df['upload_ratio'] = df['orig_bytes'] / (total_bytes + 1e-9);
+    df['bytes_per_packet'] = total_bytes / (total_packets + 1e-9)
+    safe_duration = np.expm1(df['duration']).clip(lower=0.001);
+    df['packet_rate'] = (total_packets / safe_duration).clip(upper=10000)
     df['is_scanning_signature'] = ((df['is_port_23'] == 1) & (df['is_S0_state'] == 1)).astype(np.int8)
     df['suspicious_score'] = df['is_port_23'] * 40 + df['is_S0_state'] * 30 + df['is_port_22'] * 25
     if 'id.resp_h' in df.columns:
-        resp_ip_features = extract_ip_features(df['id.resp_h']); resp_ip_features.columns = ['resp_' + col for col in resp_ip_features.columns]
-        df = pd.concat([df, resp_ip_features], axis=1); df = df.drop(columns=['id.resp_h'])
+        resp_ip_features = extract_ip_features(df['id.resp_h']);
+        resp_ip_features.columns = ['resp_' + col for col in resp_ip_features.columns]
+        df = pd.concat([df, resp_ip_features], axis=1);
+        df = df.drop(columns=['id.resp_h'])
     if 'id.orig_h' in df.columns:
-        orig_ip_features = extract_ip_features(df['id.orig_h']); orig_ip_features.columns = ['orig_' + col for col in orig_ip_features.columns]
-        df = pd.concat([df, orig_ip_features], axis=1); df = df.drop(columns=['id.orig_h'])
+        orig_ip_features = extract_ip_features(df['id.orig_h']);
+        orig_ip_features.columns = ['orig_' + col for col in orig_ip_features.columns]
+        df = pd.concat([df, orig_ip_features], axis=1);
+        df = df.drop(columns=['id.orig_h'])
     df = df.drop(columns=['id.resp_p'], errors='ignore')
     return df
 
@@ -189,18 +224,22 @@ def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
     output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR, os.path.basename(file_path).replace('.csv', '.parquet'))
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"\n  📄 {os.path.basename(file_path)} ({file_size_mb:.1f} MB)")
-    t_start = time.time(); chunks_list = []; total_rows = 0
+    t_start = time.time();
+    chunks_list = [];
+    total_rows = 0
     # Added comment='#' to handle files that might have commented header lines
     for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE, low_memory=False, on_bad_lines='skip', comment='#'):
         processed = _preprocess_partition(chunk, all_categorical_values)
         ground_truth_family = Config.FILENAME_TO_FAMILY_MAP.get(file_key, 'Unknown')
         processed[Config.FAMILY_TARGET_COL] = ground_truth_family
         if ground_truth_family == 'Benign':
-            processed[Config.TARGET_COL] = 'Benign'; processed[Config.DETAILED_TARGET_COL] = 'Benign'
+            processed[Config.TARGET_COL] = 'Benign';
+            processed[Config.DETAILED_TARGET_COL] = 'Benign'
         else:
             if Config.TARGET_COL not in processed.columns: processed[Config.TARGET_COL] = 'Malicious'
             if Config.DETAILED_TARGET_COL not in processed.columns: processed[Config.DETAILED_TARGET_COL] = 'Unknown'
-        chunks_list.append(processed); total_rows += len(processed)
+        chunks_list.append(processed);
+        total_rows += len(processed)
     if chunks_list:
         final_df = pd.concat(chunks_list, ignore_index=True)
         final_df.to_parquet(output_path, engine='pyarrow', compression='snappy', index=False)
@@ -224,7 +263,8 @@ def build_engineered_dataset():
     overall_start = time.time()
     csv_files = glob.glob(os.path.join(Config.RAW_DIR_ORIGINAL, '*.csv'))
     if not csv_files:
-        print(f"❌ Error: No CSV files found in '{Config.RAW_DIR_ORIGINAL}'"); return
+        print(f"❌ Error: No CSV files found in '{Config.RAW_DIR_ORIGINAL}'");
+        return
 
     print(f"\n📁 Found {len(csv_files)} CSV files to process")
     all_categorical_values = scan_categorical_values(csv_files)
@@ -233,12 +273,15 @@ def build_engineered_dataset():
     print("\n" + "=" * 70)
     print("🔍 STAGE 1: PROCESSING FILES (PARALLEL)")
     print("=" * 70)
-    stage1_start = time.time(); files_processed, files_skipped = 0, 0
+    stage1_start = time.time();
+    files_processed, files_skipped = 0, 0
     files_to_process = []
     for file_path in csv_files:
         output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR, os.path.basename(file_path).replace('.csv', '.parquet'))
-        if os.path.exists(output_path): files_skipped += 1
-        else: files_to_process.append(file_path)
+        if os.path.exists(output_path):
+            files_skipped += 1
+        else:
+            files_to_process.append(file_path)
 
     if files_to_process:
         print(f"\n🚀 Processing {len(files_to_process)} new files in parallel...")
@@ -246,8 +289,10 @@ def build_engineered_dataset():
             args_list = [(fp, all_categorical_values) for fp in files_to_process]
             futures = {executor.submit(process_single_csv, args): args for args in args_list}
             for future in as_completed(futures):
-                try: future.result(); files_processed += 1
-                except Exception as e: print(f"    ❌ ERROR: {e}")
+                try:
+                    future.result(); files_processed += 1
+                except Exception as e:
+                    print(f"    ❌ ERROR: {e}")
 
     stage1_time = time.time() - stage1_start
     print("\n" + "=" * 70)
@@ -282,15 +327,18 @@ def build_engineered_dataset():
             large_files_to_sample.append((pq_file, row_count))
             total_rows_in_large_files += row_count
 
-    print(f"✓ Found {len(small_files_to_keep)} small files (Total: {rows_from_small_files:,} rows) to be fully included.")
-    print(f"✓ Found {len(large_files_to_sample)} large files (Total: {total_rows_in_large_files:,} rows) to be sampled from.")
+    print(
+        f"✓ Found {len(small_files_to_keep)} small files (Total: {rows_from_small_files:,} rows) to be fully included.")
+    print(
+        f"✓ Found {len(large_files_to_sample)} large files (Total: {total_rows_in_large_files:,} rows) to be sampled from.")
 
     remaining_rows_to_sample = Config.SAMPLE_SIZE - rows_from_small_files
 
     # Pass 2: Load/sample files based on the budget
     all_samples = []
     if remaining_rows_to_sample <= 0:
-        print("⚠️ Warning: Small files alone meet or exceed the sample size. Sampling only from small files to meet target.")
+        print(
+            "⚠️ Warning: Small files alone meet or exceed the sample size. Sampling only from small files to meet target.")
         temp_df = pd.concat([pd.read_parquet(f) for f in small_files_to_keep], ignore_index=True)
         all_samples.append(temp_df.sample(n=Config.SAMPLE_SIZE, random_state=Config.RANDOM_STATE))
     else:
@@ -324,7 +372,7 @@ def build_engineered_dataset():
     print("\n⏳ Building final feature list...")
     target_cols = [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL, 'attack_subtype']
     final_feature_list = [col for col in final_df.columns if col not in target_cols]
-    final_df = final_df[final_feature_list + target_cols] # Ensure column order
+    final_df = final_df[final_feature_list + target_cols]  # Ensure column order
     joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
     print(f"✓ Feature list saved with {len(final_feature_list)} features.")
 
