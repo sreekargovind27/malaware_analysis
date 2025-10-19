@@ -424,7 +424,8 @@ def build_engineered_dataset():
     try:
         print("\n⏳ Reading with Dask...")
         ddf = dd.read_parquet(
-            os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet')
+            os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet'),
+            blocksize='64MB'  # ← ADD THIS LINE
         )
 
         if Config.SAMPLE_SIZE:

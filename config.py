@@ -45,7 +45,7 @@ class Config:
     }
 
     # ==================== DATA SETTINGS ====================
-    SAMPLE_SIZE = None
+    SAMPLE_SIZE = 50000000
     TEST_SIZE = 0.2
     RANDOM_STATE = 42
 
