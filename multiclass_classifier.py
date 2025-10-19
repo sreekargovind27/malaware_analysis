@@ -21,11 +21,11 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader, TensorDataset  # Use TensorDataset
+from torch.utils.data import DataLoader  # Use TensorDataset
 from tqdm import tqdm
 
 from config import Config
-from data_loader import get_data_for_multiclass
+from data_loader import get_data_for_multiclass, IoTDataset
 
 
 # NOTE: IoTDataset is no longer needed from data_loader for this script
@@ -327,75 +327,6 @@ class MultiClassNeuralNetModel:
         print(f"  Learning rate: {self.learning_rate}")
         print(f"  Batch normalization: {self.use_batch_norm}")
 
-    def _objective(self, trial, X_train_gpu, y_train_gpu, X_val_gpu, y_val_gpu):
-        print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
-
-        # Suggest parameters
-        n_layers = trial.suggest_int('n_layers', 2, 4)
-        hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
-        dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
-        use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
-        learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384, 32768, 65536])
-
-        print(
-            f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
-
-        # Create model and components
-        temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
-                                         use_batch_norm).to(self.device)
-        temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
-        temp_criterion = nn.CrossEntropyLoss()
-
-        # Create DataLoaders
-        train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
-
-        num_epochs = 40
-        best_val_acc = 0
-        patience_counter = 0
-
-        for epoch in range(num_epochs):
-            # Training loop
-            temp_model.train()
-            for X_batch, y_batch in train_loader:
-                temp_optimizer.zero_grad()
-                outputs = temp_model(X_batch)
-                loss = temp_criterion(outputs, y_batch)
-                loss.backward()
-                temp_optimizer.step()
-
-            # Validation loop
-            temp_model.eval()
-            val_correct, val_total = 0, 0
-            with torch.no_grad():
-                for X_batch, y_batch in val_loader:
-                    outputs = temp_model(X_batch)
-                    _, predicted = torch.max(outputs, 1)
-                    val_total += y_batch.size(0)
-                    val_correct += (predicted == y_batch).sum().item()
-
-            val_acc = val_correct / val_total
-            print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
-
-            # Early stopping and Optuna reporting
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= 5:
-                    print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
-                    break
-
-            trial.report(val_acc, epoch)
-            if trial.should_prune():
-                print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
-                raise optuna.TrialPruned()
-
-        print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
-        return best_val_acc
-
     def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
         """Use Optuna to find best hyperparameters for Neural Network"""
         print("\n" + "=" * 70)
@@ -404,7 +335,6 @@ class MultiClassNeuralNetModel:
         t_start = time.time()
 
         if not Config.USE_OPTUNA:
-            print("\n⏭️  Optuna disabled in config, using default parameters")
             return {
                 'n_layers': 3, 'layer_1': 128, 'layer_2': 64, 'layer_3': 32,
                 'dropout_rate': 0.3, 'learning_rate': 0.001, 'batch_size': 4096,
@@ -421,27 +351,82 @@ class MultiClassNeuralNetModel:
         X_val_scaled = scaler.transform(X_val)
         print("   ✓ Data scaled.")
 
-        print("   Pre-shuffling and moving Optuna data to GPU...")
-        perm = torch.randperm(len(X_train_scaled))
-        X_train_shuffled = X_train_scaled[perm]
-        y_train_shuffled = y_train[perm]
-        X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
-        y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
-        X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
-        y_val_gpu = torch.LongTensor(y_val).to(self.device)
-        del X_train_scaled, X_val_scaled, X_train_shuffled, y_train_shuffled, perm
-        print("   ✓ Optuna data is on GPU and pre-shuffled.")
+        def objective(trial):
+            print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
+
+            n_layers = trial.suggest_int('n_layers', 2, 4)
+            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128, 256]) for i in range(n_layers)]
+            dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
+            use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
+            learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+            batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384])
+
+            print(
+                f"  - Params: LR={learning_rate:.5f}, Batch={batch_size}, Layers={hidden_layers}, Dropout={dropout_rate:.2f}")
+
+            temp_model = MultiClassNeuralNet(self.input_dim, self.num_classes, hidden_layers, dropout_rate,
+                                             use_batch_norm).to(self.device)
+            temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
+            temp_criterion = nn.CrossEntropyLoss()
+
+            train_loader = DataLoader(
+                IoTDataset(X_train_scaled, y_train),
+                batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True
+            )
+            val_loader = DataLoader(
+                IoTDataset(X_val_scaled, y_val),
+                batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True
+            )
+
+            num_epochs = 20
+            best_val_acc = 0
+            patience_counter = 0
+
+            for epoch in range(num_epochs):
+                temp_model.train()
+                for X_batch, y_batch in train_loader:
+                    X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                    temp_optimizer.zero_grad()
+                    outputs = temp_model(X_batch)
+                    loss = temp_criterion(outputs, y_batch)
+                    loss.backward()
+                    temp_optimizer.step()
+
+                temp_model.eval()
+                val_correct, val_total = 0, 0
+                with torch.no_grad():
+                    for X_batch, y_batch in val_loader:
+                        X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
+                        outputs = temp_model(X_batch)
+                        _, predicted = torch.max(outputs, 1)
+                        val_total += y_batch.size(0)
+                        val_correct += (predicted == y_batch).sum().item()
+
+                val_acc = val_correct / val_total
+
+                if (epoch + 1) % 5 == 0:  # Print every 5 epochs to reduce log spam
+                    print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= 5:
+                        print(f"    Early stopping trial {trial.number} at epoch {epoch + 1}.")
+                        break
+                trial.report(val_acc, epoch)
+                if trial.should_prune():
+                    print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
+                    raise optuna.TrialPruned()
+
+            print(f"--- [NN] Trial {trial.number} finished. Best Val Acc: {best_val_acc:.4f} ---")
+            return best_val_acc
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
         study = optuna.create_study(direction='maximize', sampler=sampler, pruner=optuna.pruners.MedianPruner())
-
-        study.optimize(
-            lambda trial: self._objective(trial, X_train_gpu, y_train_gpu, X_val_gpu, y_val_gpu),
-            n_trials=Config.OPTUNA_N_TRIALS,
-            timeout=Config.OPTUNA_TIMEOUT,
-            show_progress_bar=True
-        )
-
+        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT,
+                       show_progress_bar=True)
         t_elapsed = time.time() - t_start
 
         print(f"\n✅ Optimization complete")
@@ -475,10 +460,8 @@ class MultiClassNeuralNetModel:
             print("🎯 TRAINING FINAL MODEL WITH OPTIMIZED PARAMETERS")
             print("=" * 70)
 
-            self.model = MultiClassNeuralNet(
-                self.input_dim, self.num_classes, self.hidden_layers,
-                self.dropout_rate, self.use_batch_norm
-            ).to(self.device)
+            self.model = MultiClassNeuralNet(self.input_dim, self.num_classes, self.hidden_layers, self.dropout_rate,
+                                             self.use_batch_norm).to(self.device)
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         else:
             batch_size = 4096
@@ -495,26 +478,22 @@ class MultiClassNeuralNetModel:
         X_val_scaled = self.scaler.transform(X_val)
         print(f"✓ Scaling complete.")
 
-        print(f"⏳ Pre-shuffling and moving final training data to GPU...")
-        perm = torch.randperm(len(X_train_scaled))
-        X_train_shuffled = X_train_scaled[perm]
-        y_train_shuffled = y_train[perm]
-        X_train_gpu = torch.FloatTensor(X_train_shuffled).to(self.device)
-        y_train_gpu = torch.LongTensor(y_train_shuffled).to(self.device)
-        X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
-        y_val_gpu = torch.LongTensor(y_val).to(self.device)
-        del X_train_scaled, X_val_scaled, X_train, y_train, X_val, y_val, X_train_shuffled, y_train_shuffled, perm
-        print("✓ Final training data is on GPU and pre-shuffled.")
-
-        print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,})...")
-        train_loader = DataLoader(TensorDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(TensorDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
+        final_train_workers = 0 if os.name == 'nt' else 8
+        print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,}, Workers: {final_train_workers})...")
+        train_loader = DataLoader(
+            IoTDataset(X_train_scaled, y_train),
+            batch_size=batch_size, shuffle=True,
+            num_workers=final_train_workers, pin_memory=True
+        )
+        val_loader = DataLoader(
+            IoTDataset(X_val_scaled, y_val),
+            batch_size=batch_size, shuffle=False,
+            num_workers=final_train_workers, pin_memory=True
+        )
         print(f"✓ DataLoaders created")
 
         print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
-
         t_train_start = time.time()
-
         best_val_acc = 0
         patience_counter = 0
         progress_bar = tqdm(range(50), desc="Training")
@@ -523,6 +502,7 @@ class MultiClassNeuralNetModel:
             self.model.train()
             total_train_loss = 0
             for X_batch, y_batch in train_loader:
+                X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
                 self.optimizer.zero_grad()
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
@@ -535,6 +515,7 @@ class MultiClassNeuralNetModel:
             val_correct, val_total, total_val_loss = 0, 0, 0
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
+                    X_batch, y_batch = X_batch.to(self.device, non_blocking=True)
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
                     total_val_loss += loss.item()
@@ -560,7 +541,6 @@ class MultiClassNeuralNetModel:
                     break
 
         self.load_model('best_multiclass_nn.pth')
-
         t_train = time.time() - t_train_start
         total_time = time.time() - overall_start
 

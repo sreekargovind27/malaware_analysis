@@ -1,10 +1,9 @@
 """
 Lightweight data loaders for model training.
-All functions read from the final, pre-engineered dataset created by 'build_dataset.py'.
-UPDATED: Added detailed timing for all operations.
+Classification functions now read from the pre-split master datasets.
+Unsupervised functions (autoencoder, clustering) still load the full dataset.
 """
 import os
-import time
 
 import joblib
 import numpy as np
@@ -32,419 +31,222 @@ class IoTDataset(Dataset):
 
 
 def load_engineered_data():
-    """Load the pre-engineered dataset with timing."""
-    print("\n" + "=" * 70)
-    print("📂 LOADING ENGINEERED DATA")
-    print("=" * 70)
-
-    t_start = time.time()
-
-    if not os.path.exists(Config.ENGINEERED_DATA_PATH):
-        raise FileNotFoundError(
-            f"Engineered data not found at '{Config.ENGINEERED_DATA_PATH}'. "
-            f"Please run 'build_dataset.py' first."
-        )
-
-    file_size_mb = os.path.getsize(Config.ENGINEERED_DATA_PATH) / (1024 * 1024)
-    print(f"\n⏳ Loading from: {Config.ENGINEERED_DATA_PATH}")
-    print(f"   File size: {file_size_mb:.1f} MB")
-
-    df = pd.read_parquet(Config.ENGINEERED_DATA_PATH)
-
-    t_elapsed = time.time() - t_start
-
-    print(f"\n✅ Data loaded successfully")
-    print(f"   Rows: {len(df):,}")
-    print(f"   Columns: {len(df.columns)}")
-    print(f"⏱️  Load time: {t_elapsed:.2f}s ({file_size_mb / t_elapsed:.1f} MB/s)")
-    print("=" * 70)
-
+    """Loads the main 50M row engineered dataset."""
+    path = Config.ENGINEERED_DATA_PATH
+    print(f"\n📂 Loading FULL engineered data from: {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Engineered data not found at '{path}'. Please run 'build_dataset.py' first.")
+    df = pd.read_parquet(path)
+    print(f"✓ Loaded {len(df):,} total samples.")
     return df
 
 
+def load_master_train_set():
+    """Loads the pre-split training dataset."""
+    path = 'data/master_splits/train_set.parquet'
+    print(f"\n📂 Loading MASTER TRAIN set from: {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Master train set not found at '{path}'. Please run 'create_splits.py' first.")
+    df = pd.read_parquet(path)
+    print(f"✓ Loaded {len(df):,} training samples.")
+    return df
+
+
+def load_master_test_set():
+    """Loads the pre-split test dataset."""
+    path = 'data/master_splits/test_set.parquet'
+    print(f"\n📂 Loading MASTER TEST set from: {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Master test set not found at '{path}'. Please run 'create_splits.py' first.")
+    df = pd.read_parquet(path)
+    print(f"✓ Loaded {len(df):,} test samples.")
+    return df
+
+
+# ======================================================================
+# UNSUPERVISED/ORIGINAL DATA LOADERS (UNCHANGED)
+# ======================================================================
+
 def get_data_for_autoencoder():
-    """Load and prepare data for Autoencoder (benign only) with timing."""
+    """Load and prepare data for Autoencoder (benign only) from the full dataset."""
     print("\n" + "=" * 70)
-    print("🔧 PREPARING DATA FOR AUTOENCODER")
+    print("🔧 PREPARING DATA FOR AUTOENCODER (from full dataset)")
     print("=" * 70)
-
-    overall_start = time.time()
-
     df = load_engineered_data()
     features = Config.get_feature_list()
 
     print(f"\n⏳ Filtering benign data...")
-    t_filter_start = time.time()
     benign_df = df.loc[df[Config.TARGET_COL] == 'Benign', features]
-    t_filter = time.time() - t_filter_start
-    print(f"✓ Filtered to {len(benign_df):,} benign samples ({t_filter:.2f}s)")
+    print(f"✓ Filtered to {len(benign_df):,} benign samples")
 
-    # Remove constant columns
     print(f"\n⏳ Removing constant columns...")
-    t_const_start = time.time()
     non_constant_cols = benign_df.columns[benign_df.std() > 1e-6].tolist()
-
-    if len(non_constant_cols) < len(features):
-        removed_cols = set(features) - set(non_constant_cols)
-        print(f"   Removed {len(removed_cols)} constant columns")
-
-    if not non_constant_cols:
-        print("❌ ERROR: No features with variance found!")
-        return None, None, None, []
-
-    t_const = time.time() - t_const_start
-    print(f"✓ Kept {len(non_constant_cols)} features with variance ({t_const:.2f}s)")
-
-    # Save feature list
     joblib.dump(non_constant_cols, Config.AUTOENCODER_FEATURE_LIST_PATH)
+    X = benign_df[non_constant_cols].fillna(0)
 
-    # Get data
-    X = benign_df[non_constant_cols]
-
-    # Handle NaN BEFORE scaling
-    print(f"\n⏳ Checking for missing values...")
-    nan_count = X.isna().sum().sum()
-    if nan_count > 0:
-        print(f"   ⚠️  Found {nan_count:,} NaN values. Filling with 0...")
-        X = X.fillna(0)
-    else:
-        print(f"   ✓ No missing values")
-
-    # Scale
     print(f"\n⏳ Scaling features...")
-    t_scale_start = time.time()
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X.values)
-    t_scale = time.time() - t_scale_start
-    print(f"✓ Scaling complete ({t_scale:.2f}s)")
+    X_scaled = np.nan_to_num(X_scaled)  # Handle any potential NaN/Inf after scaling
 
-    # CRITICAL: Handle NaN/Inf AFTER scaling
-    nan_count = np.isnan(X_scaled).sum()
-    if nan_count > 0:
-        print(f"   ⚠️  Found {nan_count:,} NaN after scaling. Replacing with 0...")
-        X_scaled = np.nan_to_num(X_scaled, nan=0.0)
-
-    inf_count = np.isinf(X_scaled).sum()
-    if inf_count > 0:
-        print(f"   ⚠️  Found {inf_count:,} Inf values. Replacing with 0...")
-        X_scaled = np.nan_to_num(X_scaled, posinf=0.0, neginf=0.0)
-
-    # Check for extreme values
-    max_val = np.abs(X_scaled).max()
-    if max_val > 100:
-        print(f"   ⚠️  Large values detected (max={max_val:.2f}). Clipping to [-100, 100]...")
-        X_scaled = np.clip(X_scaled, -100, 100)
-
-    # Final check
-    if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
-        print("   ❌ ERROR: Still have NaN/Inf after cleaning! Setting all to 0...")
-        X_scaled = np.zeros_like(X_scaled)
-
-    # Split train/val
     print(f"\n⏳ Creating train/validation split...")
-    t_split_start = time.time()
-
-    if len(X_scaled) < 2:
-        print("❌ ERROR: Not enough data for train/val split")
-        return None, None, None, []
-
     X_train, X_val = train_test_split(X_scaled, test_size=0.2, random_state=Config.RANDOM_STATE)
-    t_split = time.time() - t_split_start
-    print(f"✓ Split complete ({t_split:.2f}s)")
 
-    # Create DataLoaders
     print(f"\n⏳ Creating PyTorch DataLoaders...")
-    t_loader_start = time.time()
-
     train_loader = DataLoader(
-        IoTDataset(X_train),
-        batch_size=Config.AUTOENCODER_BATCH_SIZE,  # Larger batch
-        shuffle=True,
-        num_workers=Config.NUM_WORKERS,
-        pin_memory=True,  # ← ADD THIS
-        persistent_workers=True  # ← ADD THIS
+        IoTDataset(X_train), batch_size=Config.AUTOENCODER_BATCH_SIZE, shuffle=True,
+        num_workers=Config.NUM_WORKERS, pin_memory=True
     )
-
     val_loader = DataLoader(
-        IoTDataset(X_val),
-        batch_size=Config.AUTOENCODER_BATCH_SIZE,
-        shuffle=False,
-        num_workers=Config.NUM_WORKERS,
-        pin_memory=True,  # ← ADD THIS
-        persistent_workers=True  # ← ADD THIS
+        IoTDataset(X_val), batch_size=Config.AUTOENCODER_BATCH_SIZE, shuffle=False,
+        num_workers=Config.NUM_WORKERS, pin_memory=True
     )
-
-    t_loader = time.time() - t_loader_start
-    print(f"✓ DataLoaders created ({t_loader:.2f}s)")
-
-    total_time = time.time() - overall_start
-
-    print(f"\n" + "=" * 70)
-    print(f"✅ AUTOENCODER DATA READY")
-    print(f"   Train samples: {len(X_train):,}")
-    print(f"   Val samples:   {len(X_val):,}")
-    print(f"   Features:      {len(non_constant_cols)}")
-    print(f"   Batch size:    {Config.AUTOENCODER_BATCH_SIZE}")
-    print(f"   Data range:    [{X_scaled.min():.2f}, {X_scaled.max():.2f}]")
-    print(f"⏱️  Total prep time: {total_time:.2f}s")
-    print("=" * 70)
-
+    print(f"✓ Autoencoder data ready.")
     return train_loader, val_loader, scaler, non_constant_cols
 
 
-def get_data_for_binary():
-    """Load and prepare data for binary classification with timing."""
+def get_data_for_clustering():
+    """Load and prepare data for clustering (malicious only) from the full dataset."""
     print("\n" + "=" * 70)
-    print("🔧 PREPARING DATA FOR BINARY CLASSIFICATION")
+    print("🔧 PREPARING DATA FOR CLUSTERING (from full dataset)")
     print("=" * 70)
-
-    overall_start = time.time()
-
     df = load_engineered_data()
     features = Config.get_feature_list()
+    X = df[df[Config.TARGET_COL] == 'Malicious'][features]
+    print(f"✓ Filtered to {len(X):,} malicious samples.")
+    return X
 
-    print(f"\n⏳ Extracting features and labels...")
-    t_extract_start = time.time()
-    X = df[features]
-    y = (df[Config.TARGET_COL] == 'Malicious').astype(int)
-    t_extract = time.time() - t_extract_start
-    print(f"✓ Extraction complete ({t_extract:.2f}s)")
 
-    # Show class distribution
-    unique, counts = np.unique(y, return_counts=True)
-    print(f"\n📊 Class distribution:")
-    for cls, count in zip(unique, counts):
-        label = "Benign" if cls == 0 else "Malicious"
-        print(f"   {label}: {count:,} ({count / len(y) * 100:.2f}%)")
+# ======================================================================
+# SUPERVISED/CLASSIFICATION DATA LOADERS (UPDATED TO USE MASTER SPLITS)
+# ======================================================================
 
-    print(f"\n⏳ Creating train/test split (stratified)...")
-    t_split_start = time.time()
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=Config.TEST_SIZE,
-        random_state=Config.RANDOM_STATE,
-        stratify=y
-    )
-    t_split = time.time() - t_split_start
-    print(f"✓ Split complete ({t_split:.2f}s)")
-
-    total_time = time.time() - overall_start
-
-    print(f"\n" + "=" * 70)
-    print(f"✅ BINARY DATA READY")
-    print(f"   Train samples: {len(X_train):,}")
-    print(f"   Test samples:  {len(X_test):,}")
-    print(f"   Features:      {X.shape[1]}")
-    print(f"⏱️  Total prep time: {total_time:.2f}s")
+def get_data_for_binary():
+    """Prepares data for binary classification from the master splits."""
+    print("\n" + "=" * 70)
+    print("🔧 PREPARING BINARY CLASSIFICATION DATA")
     print("=" * 70)
 
+    train_df = load_master_train_set()
+    test_df = load_master_test_set()
+    features = Config.get_feature_list()
+
+    X_train = train_df[features]
+    y_train = (train_df[Config.TARGET_COL] == 'Malicious').astype(int).values
+
+    X_test = test_df[features]
+    y_test = (test_df[Config.TARGET_COL] == 'Malicious').astype(int).values
+
+    print(f"✓ Binary data ready.")
+    print(f"  - Train samples: {len(X_train):,}")
+    print(f"  - Test samples:  {len(X_test):,}")
+    print("=" * 70)
     return X_train, X_test, y_train, y_test
 
 
 def get_data_for_multiclass():
     """
-    Load and prepare data for multi-class classification with timing.
-    UPDATED: Implements class-aware undersampling to create a smaller, better-balanced dataset.
+    Prepares data for multi-class classification from the master splits.
+    Performs class-aware undersampling on the training set only.
     """
     print("\n" + "=" * 70)
-    print("🔧 PREPARING DATA FOR MULTI-CLASS CLASSIFICATION")
+    print("🔧 PREPARING MULTI-CLASS CLASSIFICATION DATA")
     print("=" * 70)
-    overall_start = time.time()
-    df = load_engineered_data()
+
+    train_df = load_master_train_set()
+    test_df = load_master_test_set()
     features = Config.get_feature_list()
 
-    # --- FIRST, filter out classes with only 1 member ---
-    print(f"\n⏳ Filtering out classes with < 2 samples...")
-    value_counts_initial = df[Config.DETAILED_TARGET_COL].value_counts()
-    to_keep = value_counts_initial[value_counts_initial >= 2].index
+    print("\n🎯 Performing class-aware undersampling on the TRAINING set...")
 
-    if len(to_keep) < len(value_counts_initial):
-        to_remove = value_counts_initial[value_counts_initial < 2].index
-        print(f"   ⚠️  Removed {len(to_remove)} classes with only 1 sample: {list(to_remove)}")
-        df_filtered = df[df[Config.DETAILED_TARGET_COL].isin(to_keep)]
-    else:
-        df_filtered = df
-        print(f"   ✓ All classes have sufficient samples for splitting.")
-
-    # --- NOW, perform undersampling on the CLEANED dataframe ---
-    print("\n" + "=" * 70)
-    print("🎯 PERFORMING CLASS-AWARE UNDERSAMPLING")
-    print("=" * 70)
-
-    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.03)
+    NEW_TARGET_TRAIN_SIZE = int(len(train_df) * 0.30)
     MINORITY_CLASS_THRESHOLD = 100000
 
-    print(f"   Original dataset size: {len(df_filtered):,} rows")
-    print(f"   New target size: {NEW_TARGET_SIZE:,} rows")
-    print(f"   Minority class threshold: {MINORITY_CLASS_THRESHOLD:,} samples")
+    print(f"   Original train size: {len(train_df):,} rows")
+    print(f"   New target train size: {NEW_TARGET_TRAIN_SIZE:,} rows")
 
-    # Use the cleaned df_filtered from now on
+    value_counts_initial = train_df[Config.DETAILED_TARGET_COL].value_counts()
+    to_keep = value_counts_initial[value_counts_initial >= 2].index
+    df_filtered = train_df[train_df[Config.DETAILED_TARGET_COL].isin(to_keep)]
+
     value_counts = df_filtered[Config.DETAILED_TARGET_COL].value_counts()
-
     small_classes = value_counts[value_counts < MINORITY_CLASS_THRESHOLD].index.tolist()
     large_classes = value_counts[value_counts >= MINORITY_CLASS_THRESHOLD].index.tolist()
-
-    print("\n   Small classes to be fully preserved:")
-    for cls in small_classes: print(f"     - {cls}: {value_counts[cls]:,} samples")
-
-    print("\n   Large classes to be undersampled:")
-    for cls in large_classes: print(f"     - {cls}: {value_counts[cls]:,} samples")
 
     df_minority = df_filtered[df_filtered[Config.DETAILED_TARGET_COL].isin(small_classes)]
     df_majority = df_filtered[df_filtered[Config.DETAILED_TARGET_COL].isin(large_classes)]
 
-    rows_to_sample_from_majority = NEW_TARGET_SIZE - len(df_minority)
+    rows_to_sample_from_majority = NEW_TARGET_TRAIN_SIZE - len(df_minority)
 
-    if rows_to_sample_from_majority <= 0:
-        print("   ⚠️ Minority classes alone exceed target size. Sampling from them.")
-        df_final = df_minority.sample(n=NEW_TARGET_SIZE, random_state=Config.RANDOM_STATE)
-    else:
-        print(f"\n   Taking all {len(df_minority):,} minority samples.")
-        print(f"   Sampling {rows_to_sample_from_majority:,} samples from the majority classes.")
+    if rows_to_sample_from_majority > 0 and len(df_majority) > rows_to_sample_from_majority:
         df_majority_sampled = df_majority.sample(n=rows_to_sample_from_majority, random_state=Config.RANDOM_STATE)
+        df_train_final = pd.concat([df_minority, df_majority_sampled], ignore_index=True)
+    else:
+        df_train_final = df_minority.sample(n=NEW_TARGET_TRAIN_SIZE, random_state=Config.RANDOM_STATE, replace=True)
 
-        print("\n   Combining preserved minority samples and undersampled majority samples...")
-        df_final = pd.concat([df_minority, df_majority_sampled], ignore_index=True)
+    print(f"✓ Undersampling complete. Final training set size: {len(df_train_final):,}")
 
-    print(f"\n✅ Undersampling complete. Final dataset size: {len(df_final):,} rows")
-    print("=" * 70)
-
-    print(f"\n⏳ Encoding labels...")
     le = LabelEncoder()
-    X = df_final[features]
-    y = le.fit_transform(df_final[Config.DETAILED_TARGET_COL])
-    print(f"✓ Encoding complete")
 
-    print(f"\n📊 Final class distribution (after undersampling):")
+    X_train = df_train_final[features]
+    y_train = le.fit_transform(df_train_final[Config.DETAILED_TARGET_COL])
+
+    test_classes_seen_in_train = [cls for cls in test_df[Config.DETAILED_TARGET_COL].unique() if cls in le.classes_]
+    test_df_filtered = test_df[test_df[Config.DETAILED_TARGET_COL].isin(test_classes_seen_in_train)]
+    X_test = test_df_filtered[features]
+    y_test = le.transform(test_df_filtered[Config.DETAILED_TARGET_COL])
+
+    joblib.dump(le, 'data/master_splits/multiclass_label_encoder.joblib')
+    print("✓ Label encoder saved.")
+
+    print(f"\n📊 Final class distribution (training set):")
+    unique, counts = np.unique(y_train, return_counts=True)
     for idx, class_name in enumerate(le.classes_):
-        count = (y == idx).sum()
-        print(f"   {class_name}: {count:,} ({count / len(y) * 100:.2f}%)")
+        count_idx = np.where(unique == idx)
+        count = counts[count_idx][0] if len(count_idx[0]) > 0 else 0
+        print(f"   {class_name}: {count:,} ({count / len(y_train) * 100:.2f}%)")
 
-    print(f"\n⏳ Creating train/test split (stratified)...")
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE, stratify=y
-        )
-        print("✓ Split complete (stratified).")
-    except ValueError as e:
-        print(f"   ❌ CRITICAL ERROR DURING SPLIT: {e}")
-        print("   ⚠️ Could not stratify due to small class sizes. Using random split.")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE
-        )
-        print("✓ Split complete (random).")
-
-    total_time = time.time() - overall_start
-    print(f"\n" + "=" * 70)
-    print(f"✅ MULTI-CLASS DATA READY")
-    print(
-        f"   Train samples: {len(X_train):,}\n   Test samples:  {len(X_test):,}\n   Features:      {X.shape[1]}\n   Classes:       {len(le.classes_)}")
-    print(f"⏱️  Total prep time: {total_time:.2f}s")
+    print(f"\n✓ Multiclass data ready.")
+    print(f"  - Train samples: {len(X_train):,}")
+    print(f"  - Test samples:  {len(X_test):,}")
     print("=" * 70)
     return X_train, X_test, y_train, y_test, le
 
 
 def get_data_for_virus():
-    """Load and prepare data for virus/malware family classification with timing."""
+    """Prepares data for virus classification from the master splits."""
     print("\n" + "=" * 70)
-    print("🔧 PREPARING DATA FOR VIRUS CLASSIFICATION")
+    print("🔧 PREPARING VIRUS CLASSIFICATION DATA")
     print("=" * 70)
 
-    overall_start = time.time()
-
-    df = load_engineered_data()
+    train_df = load_master_train_set()
+    test_df = load_master_test_set()
     features = Config.get_feature_list()
 
-    print(f"\n⏳ Filtering malicious samples...")
-    t_filter_start = time.time()
-    malicious_df = df[df[Config.TARGET_COL] == 'Malicious'].copy()
-    malicious_df = malicious_df[malicious_df[Config.FAMILY_TARGET_COL] != 'Benign']
-    t_filter = time.time() - t_filter_start
-    print(f"✓ Filtered to {len(malicious_df):,} malicious samples ({t_filter:.2f}s)")
+    train_malicious = train_df[train_df[Config.TARGET_COL] == 'Malicious'].copy()
+    test_malicious = test_df[test_df[Config.TARGET_COL] == 'Malicious'].copy()
 
-    # Filter out families with only one sample
-    print(f"\n⏳ Filtering families with sufficient samples...")
-    value_counts = malicious_df[Config.FAMILY_TARGET_COL].value_counts()
+    value_counts = train_malicious[Config.FAMILY_TARGET_COL].value_counts()
     to_keep = value_counts[value_counts >= 2].index
-    malicious_df = malicious_df[malicious_df[Config.FAMILY_TARGET_COL].isin(to_keep)]
+    train_malicious = train_malicious[train_malicious[Config.FAMILY_TARGET_COL].isin(to_keep)]
 
-    print(f"   Kept families with ≥2 samples")
-
-    if malicious_df[Config.FAMILY_TARGET_COL].nunique() < 2:
-        raise ValueError("Not enough malware family diversity to train the virus classifier.")
-
-    print(f"\n⏳ Encoding labels...")
-    t_encode_start = time.time()
     le = LabelEncoder()
-    X = malicious_df[features]
-    y = le.fit_transform(malicious_df[Config.FAMILY_TARGET_COL])
-    t_encode = time.time() - t_encode_start
-    print(f"✓ Encoding complete ({t_encode:.2f}s)")
 
-    # Show family distribution
-    print(f"\n📊 Malware family distribution:")
-    for idx, family_name in enumerate(le.classes_):
-        count = (y == idx).sum()
-        print(f"   {family_name}: {count:,} ({count / len(y) * 100:.2f}%)")
+    X_train = train_malicious[features]
+    y_train = le.fit_transform(train_malicious[Config.FAMILY_TARGET_COL])
 
-    # Perform the split
-    print(f"\n⏳ Creating train/test split...")
-    t_split_start = time.time()
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y,
-            test_size=Config.TEST_SIZE,
-            random_state=Config.RANDOM_STATE,
-            stratify=y
-        )
-        print(f"✓ Split complete (stratified) ({time.time() - t_split_start:.2f}s)")
-    except ValueError:
-        print("   ⚠️  Could not stratify due to small class sizes. Using random split.")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y,
-            test_size=Config.TEST_SIZE,
-            random_state=Config.RANDOM_STATE
-        )
-        print(f"✓ Split complete (random) ({time.time() - t_split_start:.2f}s)")
+    test_classes_seen_in_train = [cls for cls in test_malicious[Config.FAMILY_TARGET_COL].unique() if
+                                  cls in le.classes_]
+    test_malicious_filtered = test_malicious[test_malicious[Config.FAMILY_TARGET_COL].isin(test_classes_seen_in_train)]
+    X_test = test_malicious_filtered[features]
+    y_test = le.transform(test_malicious_filtered[Config.FAMILY_TARGET_COL])
 
-    total_time = time.time() - overall_start
+    joblib.dump(le, 'data/master_splits/virus_label_encoder.joblib')
+    print("✓ Label encoder saved.")
 
-    print(f"\n" + "=" * 70)
-    print(f"✅ VIRUS DATA READY")
-    print(f"   Train samples: {len(X_train):,}")
-    print(f"   Test samples:  {len(X_test):,}")
-    print(f"   Features:      {X.shape[1]}")
-    print(f"   Families:      {len(le.classes_)}")
-    print(f"⏱️  Total prep time: {total_time:.2f}s")
+    print(f"\n✓ Virus data ready.")
+    print(f"  - Train samples: {len(X_train):,}")
+    print(f"  - Test samples:  {len(X_test):,}")
     print("=" * 70)
-
     return X_train, X_test, y_train, y_test, le
 
-
-def get_data_for_clustering():
-    """Load and prepare data for clustering (malicious only) with timing."""
-    print("\n" + "=" * 70)
-    print("🔧 PREPARING DATA FOR CLUSTERING")
-    print("=" * 70)
-
-    overall_start = time.time()
-
-    df = load_engineered_data()
-    features = Config.get_feature_list()
-
-    print(f"\n⏳ Filtering malicious samples...")
-    t_filter_start = time.time()
-    X = df[df[Config.TARGET_COL] == 'Malicious'][features]
-    t_filter = time.time() - t_filter_start
-    print(f"✓ Filtered to {len(X):,} malicious samples ({t_filter:.2f}s)")
-
-    total_time = time.time() - overall_start
-
-    print(f"\n" + "=" * 70)
-    print(f"✅ CLUSTERING DATA READY")
-    print(f"   Samples:  {len(X):,}")
-    print(f"   Features: {X.shape[1]}")
-    print(f"⏱️  Total prep time: {total_time:.2f}s")
-    print("=" * 70)
-
-    return X
