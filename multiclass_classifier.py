@@ -1,7 +1,7 @@
 """
 Multi-Class Classification: Attack Type Detection
 Uses XGBoost and PyTorch Neural Network with SMOTE and Optuna optimization.
-UPDATED: Added Optuna tuning, enhanced progress tracking, CUDA warmup, and pin_memory.
+UPDATED: Implemented Strategy 2 (Pre-load data to GPU) for maximum speed.
 """
 
 import os
@@ -301,7 +301,7 @@ class MultiClassNeuralNetModel:
             self.dropout_rate, self.use_batch_norm
         ).to(self.device)
 
-        # ADDED: CUDA Warmup Block
+        # 1. ADDED: CUDA Warmup Block
         if self.device != 'cpu':
             print("⏳ Warming up CUDA context and compiling kernels...")
             try:
@@ -362,6 +362,15 @@ class MultiClassNeuralNetModel:
         X_val_scaled = scaler.transform(X_val)
         print("   ✓ Data scaled.")
 
+        # --- STRATEGY 2 CHANGE ---
+        print("   Moving Optuna data to GPU...")
+        X_train_gpu = torch.FloatTensor(X_train_scaled).to(self.device)
+        y_train_gpu = torch.LongTensor(y_train).to(self.device)
+        X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
+        y_val_gpu = torch.LongTensor(y_val).to(self.device)
+        del X_train_scaled, X_val_scaled # Free up RAM
+        print("   ✓ Optuna data is on GPU.")
+
         def objective(trial):
             print(f"\n--- [NN] Starting Optuna Trial {trial.number} ---")
 
@@ -391,21 +400,10 @@ class MultiClassNeuralNetModel:
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.CrossEntropyLoss()
 
-            # Create data loaders
-            print("  - Creating DataLoaders...")
-            train_loader = DataLoader(
-                IoTDataset(X_train_scaled, y_train),
-                batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS,
-                pin_memory=True # ADDED: pin_memory=True
-            )
-            val_loader = DataLoader(
-                IoTDataset(X_val_scaled, y_val),
-                batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS,
-                pin_memory=True # ADDED: pin_memory=True
-            )
-            print("  - ✓ DataLoaders created. Starting training...")
+            # Create data loaders from GPU tensors
+            train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
 
-            # Train for limited epochs
             num_epochs = min(20, 50)
             best_val_acc = 0
             patience_counter = 0
@@ -414,7 +412,7 @@ class MultiClassNeuralNetModel:
                 # Train
                 temp_model.train()
                 for X_batch, y_batch in train_loader:
-                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                    # Data is already on GPU, no need for .to(device)
                     temp_optimizer.zero_grad()
                     outputs = temp_model(X_batch)
                     loss = temp_criterion(outputs, y_batch)
@@ -423,18 +421,16 @@ class MultiClassNeuralNetModel:
 
                 # Validate
                 temp_model.eval()
-                val_correct = 0
-                val_total = 0
+                val_correct, val_total = 0, 0
                 with torch.no_grad():
                     for X_batch, y_batch in val_loader:
-                        X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                        # Data is already on GPU
                         outputs = temp_model(X_batch)
                         _, predicted = torch.max(outputs, 1)
                         val_total += y_batch.size(0)
                         val_correct += (predicted == y_batch).sum().item()
 
                 val_acc = val_correct / val_total
-
                 print(f"    Epoch {epoch + 1}/{num_epochs} -> Val Acc: {val_acc:.4f}")
 
                 if val_acc > best_val_acc:
@@ -447,7 +443,6 @@ class MultiClassNeuralNetModel:
                         break
 
                 trial.report(val_acc, epoch)
-
                 if trial.should_prune():
                     print(f"    Pruning trial {trial.number} at epoch {epoch + 1}.")
                     raise optuna.TrialPruned()
@@ -456,24 +451,13 @@ class MultiClassNeuralNetModel:
             return best_val_acc
 
         sampler = TPESampler(seed=Config.RANDOM_STATE)
-        study = optuna.create_study(
-            direction='maximize',
-            sampler=sampler,
-            pruner=optuna.pruners.MedianPruner()
-        )
-        study.optimize(
-            objective,
-            n_trials=Config.OPTUNA_N_TRIALS,
-            timeout=Config.OPTUNA_TIMEOUT,
-            show_progress_bar=True
-        )
-
+        study = optuna.create_study(direction='maximize', sampler=sampler, pruner=optuna.pruners.MedianPruner())
+        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT, show_progress_bar=True)
         t_elapsed = time.time() - t_start
 
         print(f"\n✅ Optimization complete")
         print(f"⏱️  Time: {t_elapsed:.2f}s ({t_elapsed / 60:.1f} min)")
-        print(f"\n📊 Best trial:")
-        print(f"   Validation Accuracy: {study.best_value:.4f}")
+        print(f"\n📊 Best trial:\n   Validation Accuracy: {study.best_value:.4f}")
         print(f"   Parameters:")
         for key, value in study.best_params.items():
             print(f"      {key}: {value}")
@@ -490,6 +474,7 @@ class MultiClassNeuralNetModel:
         overall_start = time.time()
 
         if use_optuna and Config.USE_OPTUNA:
+            # Pass original numpy arrays to Optuna, which handles its own GPU transfer
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
 
             n_layers = best_params['n_layers']
@@ -526,10 +511,18 @@ class MultiClassNeuralNetModel:
         t_scale = time.time() - t_scale_start
         print(f"✓ Scaling complete ({t_scale:.2f}s)")
 
+        # --- STRATEGY 2 CHANGE ---
+        print(f"⏳ Moving final training data to GPU...")
+        X_train_gpu = torch.FloatTensor(X_train_scaled).to(self.device)
+        y_train_gpu = torch.LongTensor(y_train).to(self.device)
+        X_val_gpu = torch.FloatTensor(X_val_scaled).to(self.device)
+        y_val_gpu = torch.LongTensor(y_val).to(self.device)
+        del X_train_scaled, X_val_scaled, X_train, y_train, X_val, y_val # Free up RAM
+        print("✓ Final training data is on GPU.")
+
         print(f"\n⏳ Creating DataLoaders (Batch Size: {batch_size:,})...")
-        train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS, pin_memory=True) # ADDED: pin_memory=True
-        val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False,
-                                num_workers=Config.NUM_WORKERS, pin_memory=True)  # ADDED: pin_memory=True
+        train_loader = DataLoader(IoTDataset(X_train_gpu, y_train_gpu), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(IoTDataset(X_val_gpu, y_val_gpu), batch_size=batch_size, shuffle=False)
         print(f"✓ DataLoaders created")
 
         print(f"\n⏳ Training for up to 50 epochs with early stopping (patience=10)...")
@@ -543,7 +536,7 @@ class MultiClassNeuralNetModel:
             self.model.train()
             total_train_loss = 0
             for X_batch, y_batch in train_loader:
-                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                # Data is already on GPU
                 self.optimizer.zero_grad()
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
@@ -557,7 +550,7 @@ class MultiClassNeuralNetModel:
             val_correct, val_total, total_val_loss = 0, 0, 0
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
-                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                    # Data is already on GPU
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
                     total_val_loss += loss.item()
@@ -586,7 +579,6 @@ class MultiClassNeuralNetModel:
                     break
 
         self.load_model('best_multiclass_nn.pth')
-
         t_train = time.time() - t_train_start
         total_time = time.time() - overall_start
 
@@ -600,6 +592,7 @@ class MultiClassNeuralNetModel:
         if hasattr(X, 'values'):
             X = X.values
         X_scaled = self.scaler.transform(X)
+        # Prediction data also needs to be moved to GPU
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
         self.model.eval()
         with torch.no_grad():
