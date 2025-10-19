@@ -242,7 +242,10 @@ def get_data_for_binary():
 
 
 def get_data_for_multiclass():
-    """Load and prepare data for multi-class classification with timing."""
+    """
+    Load and prepare data for multi-class classification with timing.
+    UPDATED: Implements class-aware undersampling to create a smaller, better-balanced dataset.
+    """
     print("\n" + "=" * 70)
     print("🔧 PREPARING DATA FOR MULTI-CLASS CLASSIFICATION")
     print("=" * 70)
@@ -250,37 +253,84 @@ def get_data_for_multiclass():
     df = load_engineered_data()
     features = Config.get_feature_list()
 
-    # --- FIX STARTS HERE ---
-    # 1. Identify classes with too few samples BEFORE encoding
-    print(f"\n⏳ Filtering classes with sufficient samples for splitting...")
-    value_counts = df[Config.DETAILED_TARGET_COL].value_counts()
-    to_keep = value_counts[value_counts >= 2].index
+    # --- NEW: CLASS-AWARE UNDERSAMPLING LOGIC ---
+    print("\n" + "=" * 70)
+    print("🎯 PERFORMING CLASS-AWARE UNDERSAMPLING")
+    print("=" * 70)
 
-    if len(to_keep) < len(value_counts):
-        to_remove = value_counts[value_counts < 2].index
-        print(f"   ⚠️  Removed {len(to_remove)} classes with only 1 sample: {list(to_remove)}")
-        df_filtered = df[df[Config.DETAILED_TARGET_COL].isin(to_keep)]
+    # Define the new, smaller target size (e.g., 30% of the original 50M sample)
+    NEW_TARGET_SIZE = int(Config.SAMPLE_SIZE * 0.30)
+    # Define what counts as a 'small' class that should be fully preserved
+    MINORITY_CLASS_THRESHOLD = 100000
+
+    print(f"   Original dataset size: {len(df):,} rows")
+    print(f"   New target size: {NEW_TARGET_SIZE:,} rows")
+    print(f"   Minority class threshold: {MINORITY_CLASS_THRESHOLD:,} samples")
+
+    # 1. Analyze class distribution
+    value_counts = df[Config.DETAILED_TARGET_COL].value_counts()
+
+    # 2. Identify small and large classes
+    small_classes = value_counts[value_counts < MINORITY_CLASS_THRESHOLD].index.tolist()
+    large_classes = value_counts[value_counts >= MINORITY_CLASS_THRESHOLD].index.tolist()
+
+    print("\n   Small classes to be fully preserved:")
+    for cls in small_classes:
+        print(f"     - {cls}: {value_counts[cls]:,} samples")
+
+    print("\n   Large classes to be undersampled:")
+    for cls in large_classes:
+        print(f"     - {cls}: {value_counts[cls]:,} samples")
+
+    # 3. Create two dataframes
+    df_minority = df[df[Config.DETAILED_TARGET_COL].isin(small_classes)]
+    df_majority = df[df[Config.DETAILED_TARGET_COL].isin(large_classes)]
+
+    # 4. Calculate the budget for the majority class
+    rows_to_sample_from_majority = NEW_TARGET_SIZE - len(df_minority)
+
+    if rows_to_sample_from_majority <= 0:
+        # This happens if the minority classes alone are bigger than the target size
+        print("   ⚠️ Minority classes alone exceed target size. Sampling from them.")
+        df_final = df_minority.sample(n=NEW_TARGET_SIZE, random_state=Config.RANDOM_STATE)
     else:
-        df_filtered = df
-        print(f"   ✓ All classes have sufficient samples.")
-    # --- FIX ENDS HERE ---
+        print(f"\n   Taking all {len(df_minority):,} minority samples.")
+        print(f"   Sampling {rows_to_sample_from_majority:,} samples from the majority classes.")
+        df_majority_sampled = df_majority.sample(n=rows_to_sample_from_majority, random_state=Config.RANDOM_STATE)
+
+        # 5. Combine the dataframes
+        print("\n   Combining preserved minority samples and undersampled majority samples...")
+        df_final = pd.concat([df_minority, df_majority_sampled], ignore_index=True)
+
+    print(f"\n✅ Undersampling complete. Final dataset size: {len(df_final):,} rows")
+    print("=" * 70)
+    # --- END OF NEW LOGIC ---
 
     print(f"\n⏳ Encoding labels...")
     le = LabelEncoder()
-    X = df_filtered[features]
-    y = le.fit_transform(df_filtered[Config.DETAILED_TARGET_COL])
+    # Use the new df_final dataframe from now on
+    X = df_final[features]
+    y = le.fit_transform(df_final[Config.DETAILED_TARGET_COL])
     print(f"✓ Encoding complete")
 
-    print(f"\n📊 Class distribution (after filtering):")
+    print(f"\n📊 Final class distribution (after undersampling):")
     for idx, class_name in enumerate(le.classes_):
         count = (y == idx).sum()
         print(f"   {class_name}: {count:,} ({count / len(y) * 100:.2f}%)")
 
+    # Stratify is now more important than ever because we have rare classes
     print(f"\n⏳ Creating train/test split (stratified)...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE, stratify=y
-    )
-    print(f"✓ Split complete")
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE, stratify=y
+        )
+        print("✓ Split complete (stratified).")
+    except ValueError:
+        print("   ⚠️ Could not stratify due to small class sizes. Using random split.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE
+        )
+        print("✓ Split complete (random).")
 
     total_time = time.time() - overall_start
     print(f"\n" + "=" * 70)
@@ -290,7 +340,6 @@ def get_data_for_multiclass():
     print(f"⏱️  Total prep time: {total_time:.2f}s")
     print("=" * 70)
     return X_train, X_test, y_train, y_test, le
-
 
 def get_data_for_virus():
     """Load and prepare data for virus/malware family classification with timing."""
