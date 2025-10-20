@@ -1,19 +1,24 @@
 """
-Quick data quality check on the FINAL ENGINEERED DATASET.
+Performs a data quality check on the final engineered dataset.
+It verifies the file's existence, checks for missing values, and reports on the
+distribution of the target labels.
 """
-import pandas as pd
 import os
+
+import pandas as pd
+
 from config import Config
 
+
 def check_engineered_data_quality():
-    """Check data quality on the final engineered Parquet file."""
+    """Checks the data quality of the final engineered Parquet file."""
     print("=" * 60)
     print("Engineered Data Quality Check")
     print("=" * 60)
 
     if not os.path.exists(Config.ENGINEERED_DATA_PATH):
         print(f"Engineered data file not found at '{Config.ENGINEERED_DATA_PATH}'")
-        print("Please run 'run_feature_engineering.py' first.")
+        print("Please run 'build_dataset.py' first.")
         return
 
     print(f"\nChecking '{Config.ENGINEERED_DATA_PATH}'...")
@@ -23,14 +28,14 @@ def check_engineered_data_quality():
     print(f"Total rows: {len(df):,}")
     print(f"Total features: {len(features)}")
 
-    # Check for any remaining missing values in feature columns
+    # Check for any remaining missing values in the feature columns.
     missing_values = df[features].isna().sum().sum()
     if missing_values > 0:
         print(f"\n⚠ Found {missing_values} missing values in feature columns! This should be zero.")
     else:
         print("\n✓ No missing values found in feature columns.")
 
-    # Check label distribution
+    # Check the distribution of labels.
     print("\n" + "=" * 60)
     print("Binary Label Distribution (from 'label' column)")
     print("=" * 60)
@@ -49,6 +54,7 @@ def check_engineered_data_quality():
     print("\n" + "=" * 60)
     print("✓ Data quality check complete!")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     check_engineered_data_quality()

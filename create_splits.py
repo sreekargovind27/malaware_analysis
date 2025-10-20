@@ -1,13 +1,8 @@
 """
-RUN THIS SCRIPT ONCE.
-
-This script creates the master train and test data splits for the entire project.
-It loads the main 50M row engineered dataset, performs a single stratified split,
-and saves the resulting train_set.parquet (40M rows) and test_set.parquet (10M rows)
-to disk.
-
-All other training scripts will load these pre-split files, ensuring
-perfect reproducibility.
+This script creates and saves the master train and test data splits for the project.
+It performs a single, stratified split on the main engineered dataset and saves the
+resulting files to disk. This ensures that all subsequent training scripts use the
+same data splits for reproducibility.
 """
 import os
 
@@ -22,17 +17,15 @@ def create_and_save_master_splits():
     print("🚀 CREATING AND SAVING MASTER TRAIN/TEST SPLITS")
     print("=" * 70)
 
-    # 1. Define the output directory
+    # Define the output directory and create it if it doesn't exist.
     output_dir = 'data/master_splits'
     os.makedirs(output_dir, exist_ok=True)
     print(f"   Output directory: {output_dir}")
 
-    # 2. Load the full 50M row dataset
+    # Load the full engineered dataset.
     df = load_engineered_data()
 
-    # 3. Perform the single, master train-test split
-    # We stratify on the binary 'label' column to ensure both sets
-    # have a representative amount of malicious vs. benign traffic.
+    # Perform a stratified train-test split to ensure representative class distribution.
     print(f"\n⏳ Performing 80/20 stratified split on {len(df):,} rows...")
 
     train_df, test_df = train_test_split(
@@ -43,7 +36,7 @@ def create_and_save_master_splits():
     )
     print("✓ Split complete.")
 
-    # 4. Save the splits to disk as Parquet files
+    # Save the resulting train and test sets as Parquet files.
     train_path = os.path.join(output_dir, 'train_set.parquet')
     test_path = os.path.join(output_dir, 'test_set.parquet')
 

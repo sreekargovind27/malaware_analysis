@@ -1,7 +1,6 @@
 """
-Virus/Malware Family Classification
-Classifies malware into families defined in build_dataset.py.
-UPDATED: Added SMOTE, Optuna optimization, and detailed timing.
+This script trains and evaluates a model for classifying malware into specific families.
+It utilizes LightGBM with SMOTE for handling class imbalance and Optuna for hyperparameter optimization.
 """
 
 import os
@@ -24,7 +23,7 @@ from data_loader import get_data_for_virus
 
 
 class VirusClassifier:
-    """Malware family classification using LightGBM"""
+    """A LightGBM-based classifier for identifying malware families."""
 
     def __init__(self, params=None):
         self.model = None
@@ -35,9 +34,8 @@ class VirusClassifier:
         print(f"  Using Optuna: {Config.USE_OPTUNA}")
         print(f"  Using SMOTE: {Config.USE_SMOTE}")
 
-    # ===== THIS IS THE ONLY FUNCTION THAT IS UPDATED =====
     def apply_smote(self, X_train, y_train):
-        """Apply SMOTE (oversampling only) for class imbalance in malware families."""
+        """Applies SMOTE to handle class imbalance among malware families."""
         print("\n" + "=" * 70)
         print("🔄 HANDLING CLASS IMBALANCE (Virus Families)")
         print("=" * 70)
@@ -99,11 +97,9 @@ class VirusClassifier:
             print(f"⏱️  Time: {t_elapsed:.2f}s")
             return X_train, y_train
 
-    # =========================================================
-
     def optimize_hyperparameters(self, X_train, y_train, X_val, y_val):
-        print("\n" + "=" * 70);
-        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Virus)");
+        print("\n" + "=" * 70)
+        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Virus)")
         print("=" * 70)
         t_start = time.time()
         if not Config.USE_OPTUNA:
@@ -132,36 +128,40 @@ class VirusClassifier:
         t_elapsed = time.time() - t_start
         print(
             f"\n✅ Optimization complete\n⏱️  Time: {t_elapsed:.2f}s\n\n📊 Best trial:\n   Accuracy: {study.best_value:.4f}\n   Parameters:")
-        for key, value in study.best_params.items(): print(f"      {key}: {value}")
+        for key, value in study.best_params.items():
+            print(f"      {key}: {value}")
         base_params = {'objective': 'multiclass', 'num_class': self.num_classes, 'boosting_type': 'gbdt',
                        'n_jobs': Config.N_JOBS, 'random_state': Config.RANDOM_STATE, 'metric': 'multi_logloss',
                        'verbose': -1}
-        self.best_params = {**base_params, **study.best_params};
+        self.best_params = {**base_params, **study.best_params}
         return self.best_params
 
     def _get_default_params(self):
         return {'objective': 'multiclass', 'num_class': self.num_classes, 'boosting_type': 'gbdt', 'num_leaves': 50,
-                'learning_rate': 0.1, 'n_estimators': 200, 'n_jobs': Config.N_JOBS, 'random_state': Config.RANDOM_STATE,
+                'learning_rate': 0.1, 'n_estimators': 200, 'n_jobs': Config.N_JOBS,
+                'random_state': Config.RANDOM_STATE,
                 'metric': 'multi_logloss', 'verbose': -1}
 
     def train(self, X_train, y_train, X_val=None, y_val=None, use_smote=True, use_optuna=True):
-        print("\n" + "=" * 70);
-        print("🚀 TRAINING VIRUS CLASSIFIER");
+        print("\n" + "=" * 70)
+        print("🚀 TRAINING VIRUS CLASSIFIER")
         print("=" * 70)
         overall_start = time.time()
         self.num_classes = len(np.unique(y_train))
         print(
             f"\n📊 Training data:\n   Samples: {len(X_train):,}\n   Features: {X_train.shape[1]}\n   Malware families: {self.num_classes}")
         unique, counts = np.unique(y_train, return_counts=True)
-        for cls, count in zip(unique, counts): print(f"     Family {cls}: {count:,} samples")
-        if use_smote and Config.USE_SMOTE: X_train, y_train = self.apply_smote(X_train, y_train)
+        for cls, count in zip(unique, counts):
+            print(f"     Family {cls}: {count:,} samples")
+        if use_smote and Config.USE_SMOTE:
+            X_train, y_train = self.apply_smote(X_train, y_train)
         if use_optuna and Config.USE_OPTUNA and X_val is not None:
             best_params = self.optimize_hyperparameters(X_train, y_train, X_val, y_val)
         else:
-            best_params = self._get_default_params();
+            best_params = self._get_default_params()
             print("\n⏭️  Using default parameters (no optimization)")
-        print("\n" + "=" * 70);
-        print("🎯 TRAINING FINAL MODEL");
+        print("\n" + "=" * 70)
+        print("🎯 TRAINING FINAL MODEL")
         print("=" * 70)
         t_train_start = time.time()
         if len(np.unique(y_train)) > 1:
@@ -170,10 +170,10 @@ class VirusClassifier:
             print(f"\n⚖️  Using class weights for imbalance")
         else:
             sample_weights = None
-        print(f"\n⏳ Training LightGBM...");
+        print(f"\n⏳ Training LightGBM...")
         self.model = lgb.LGBMClassifier(**best_params)
         self.model.fit(X_train, y_train, sample_weight=sample_weights)
-        t_train = time.time() - t_train_start;
+        t_train = time.time() - t_train_start
         total_time = time.time() - overall_start
         print(
             f"\n✅ Training complete\n⏱️  Training time: {t_train:.2f}s\n⏱️  Total time: {total_time:.2f}s ({total_time / 60:.1f} min)")
@@ -182,72 +182,74 @@ class VirusClassifier:
         return self.model.predict(X)
 
     def evaluate(self, X_test, y_test, label_encoder):
-        print("\n" + "=" * 70);
-        print("📊 EVALUATING VIRUS CLASSIFIER");
+        print("\n" + "=" * 70)
+        print("📊 EVALUATING VIRUS CLASSIFIER")
         print("=" * 70)
         t_eval_start = time.time()
-        print(f"\n⏳ Generating predictions...");
+        print(f"\n⏳ Generating predictions...")
         t_pred_start = time.time()
-        y_pred = self.predict(X_test);
+        y_pred = self.predict(X_test)
         t_pred = time.time() - t_pred_start
         print(
             f"✓ Predictions complete ({t_pred:.2f}s)\n   Throughput: {len(X_test) / (t_pred if t_pred > 0 else 1):.0f} samples/sec")
         target_names = label_encoder.classes_
-        print("\n" + "─" * 70);
-        print("CLASSIFICATION REPORT");
-        print("─" * 70);
+        print("\n" + "─" * 70)
+        print("CLASSIFICATION REPORT")
+        print("─" * 70)
         print(classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
         acc = accuracy_score(y_test, y_pred)
         print(f"\n{'─' * 70}\nOVERALL ACCURACY: {acc:.4f}\n{'─' * 70}")
         cm = confusion_matrix(y_test, y_pred, labels=np.arange(len(target_names)))
         self._plot_confusion_matrix(cm, target_names)
         self._plot_feature_importance(feature_names=X_test.columns)
-        t_eval = time.time() - t_eval_start;
+        t_eval = time.time() - t_eval_start
         print(f"\n⏱️  Total evaluation time: {t_eval:.2f}s")
         return {'accuracy': acc}
 
     def _plot_confusion_matrix(self, cm, target_names):
-        plt.figure(figsize=(10, 8));
+        plt.figure(figsize=(10, 8))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', xticklabels=target_names, yticklabels=target_names)
-        plt.title('Confusion Matrix - Malware Family Classification');
-        plt.ylabel('True Family');
-        plt.xlabel('Predicted Family');
+        plt.title('Confusion Matrix - Malware Family Classification')
+        plt.ylabel('True Family')
+        plt.xlabel('Predicted Family')
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_confusion_matrix.png'), dpi=300);
-        plt.close();
+        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_confusion_matrix.png'), dpi=300)
+        plt.close()
         print("  ✓ Saved confusion matrix")
 
     def _plot_feature_importance(self, feature_names):
-        importance = self.model.feature_importances_;
+        importance = self.model.feature_importances_
         indices = np.argsort(importance)[::-1][:20]
-        plt.figure(figsize=(12, 8));
+        plt.figure(figsize=(12, 8))
         sns.barplot(x=importance[indices], y=[feature_names[i] for i in indices], palette='viridis')
-        plt.xlabel('Importance');
-        plt.ylabel('Features');
-        plt.title('Top 20 Feature Importance - Virus Classification');
+        plt.xlabel('Importance')
+        plt.ylabel('Features')
+        plt.title('Top 20 Feature Importance - Virus Classification')
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_feature_importance.png'), dpi=300);
-        plt.close();
+        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_feature_importance.png'), dpi=300)
+        plt.close()
         print("  ✓ Saved feature importance plot")
 
     def analyze_families(self, X_test, y_test, label_encoder):
-        print("\n" + "=" * 70);
-        print("🔬 ANALYZING PREDICTION CONFIDENCE PER FAMILY");
+        print("\n" + "=" * 70)
+        print("🔬 ANALYZING PREDICTION CONFIDENCE PER FAMILY")
         print("=" * 70)
         t_start = time.time()
-        y_pred = self.predict(X_test);
-        y_proba = self.model.predict_proba(X_test);
+        y_pred = self.predict(X_test)
+        y_proba = self.model.predict_proba(X_test)
         families = label_encoder.classes_
         for i, family in enumerate(families):
             mask = y_test == i
-            if not np.any(mask): continue
-            family_pred = y_pred[mask];
-            correct = (family_pred == i).sum();
+            if not np.any(mask):
+                continue
+            family_pred = y_pred[mask]
+            correct = (family_pred == i).sum()
             total = mask.sum()
             accuracy = correct / total if total > 0 else 0
             avg_confidence = y_proba[mask][family_pred == i, i].mean() if correct > 0 else 0
             print(f"\n📊 {family}:\n   Samples: {total:,}\n   Accuracy: {accuracy:.2%} ({correct}/{total})")
-            if correct > 0: print(f"   Avg Confidence (when correct): {avg_confidence:.4f}")
+            if correct > 0:
+                print(f"   Avg Confidence (when correct): {avg_confidence:.4f}")
         print(f"\n⏱️  Analysis time: {time.time() - t_start:.2f}s")
 
     def save_model(self, filename='virus_classifier.pkl'):
@@ -260,8 +262,8 @@ if __name__ == "__main__":
     Config.set_seeds()
     Config.print_mode_info()
 
-    print("=" * 70);
-    print("🦠 MALWARE FAMILY CLASSIFICATION");
+    print("=" * 70)
+    print("🦠 MALWARE FAMILY CLASSIFICATION")
     print("=" * 70)
     overall_start = time.time()
     try:
@@ -286,8 +288,8 @@ if __name__ == "__main__":
             classifier.analyze_families(X_test, y_test, label_encoder)
             classifier.save_model()
             total_time = time.time() - overall_start
-            print("\n" + "=" * 70);
-            print("🎉 VIRUS CLASSIFIER COMPLETE");
+            print("\n" + "=" * 70)
+            print("🎉 VIRUS CLASSIFIER COMPLETE")
             print("=" * 70)
             print(f"⏱️  Total pipeline time: {total_time:.2f}s ({total_time / 60:.1f} min)")
             print("\n✅ Virus classifier trained successfully!")

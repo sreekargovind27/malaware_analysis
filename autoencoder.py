@@ -1,7 +1,7 @@
 """
-Autoencoder for Anomaly Detection
-Trains on benign data only, detects anomalies by reconstruction error.
-UPDATED: Added Optuna hyperparameter tuning + enhanced timing display.
+Autoencoder for Anomaly Detection.
+This model trains on benign data and identifies anomalies based on reconstruction error.
+It includes hyperparameter tuning using Optuna.
 """
 
 import os
@@ -19,7 +19,7 @@ from data_loader import get_data_for_autoencoder
 
 
 class Autoencoder(nn.Module):
-    """Flexible Autoencoder architecture with configurable layers"""
+    """Flexible Autoencoder architecture with configurable layers."""
 
     def __init__(self, input_dim, latent_dim=8, hidden_layers=None, dropout_rate=0.0):
         super(Autoencoder, self).__init__()
@@ -55,11 +55,8 @@ class Autoencoder(nn.Module):
         return self.encoder(x)
 
 
-# ============================================================================
-# === THIS IS THE CORRECTED, ROBUST AUTOENCODER WRAPPER CLASS ==============
-# ============================================================================
 class AutoencoderModel:
-    """Wrapper class for training and inference with Optuna support"""
+    """Wrapper class for the Autoencoder model, handling training and inference."""
 
     def __init__(self, input_dim):
         self.device = Config.DEVICE
@@ -86,7 +83,7 @@ class AutoencoderModel:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
     def load_model(self, filename):
-        """Load model, correctly rebuilding the architecture from the file first."""
+        """Load model, rebuilding the architecture from the file first."""
         filepath = os.path.join(Config.MODELS_DIR, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"❌ Model file {filepath} not found")
@@ -102,12 +99,12 @@ class AutoencoderModel:
         self.threshold = checkpoint.get('threshold')
         self.best_params = checkpoint.get('best_params')
 
-        self.build_model()  # Rebuild with correct architecture
+        self.build_model()
         self.model.load_state_dict(checkpoint['model_state'])
         print("✅ Model state loaded successfully into matching architecture.")
 
     def save_model(self, filename):
-        """Save model AND its architecture."""
+        """Save model and its architecture."""
         filepath = os.path.join(Config.MODELS_DIR, filename)
         if self.model is None:
             raise RuntimeError("Model has not been built yet. Cannot save.")
@@ -123,12 +120,10 @@ class AutoencoderModel:
             'best_params': self.best_params
         }, filepath)
 
-    # ... (the rest of your original functions: train, optimize_hyperparameters, detect_anomalies, etc.)
-    # ... (They will now work correctly with this new structure)
     def optimize_hyperparameters(self, train_loader, val_loader, scaler):
-        """Use Optuna to find best hyperparameters"""
-        print("\n" + "=" * 70);
-        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Autoencoder)");
+        """Use Optuna to find best hyperparameters."""
+        print("\n" + "=" * 70)
+        print("🔍 HYPERPARAMETER OPTIMIZATION WITH OPTUNA (Autoencoder)")
         print("=" * 70)
         t_start = time.time()
         if not Config.USE_OPTUNA:
@@ -149,88 +144,90 @@ class AutoencoderModel:
             temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
             temp_criterion = nn.MSELoss()
             for epoch in range(min(20, Config.AUTOENCODER_EPOCHS)):
-                temp_model.train();
+                temp_model.train()
                 for batch in train_loader:
-                    batch = batch.to(self.device);
-                    temp_optimizer.zero_grad();
-                    reconstructed = temp_model(batch);
-                    loss = temp_criterion(reconstructed, batch);
-                    loss.backward();
+                    batch = batch.to(self.device)
+                    temp_optimizer.zero_grad()
+                    reconstructed = temp_model(batch)
+                    loss = temp_criterion(reconstructed, batch)
+                    loss.backward()
                     temp_optimizer.step()
-                temp_model.eval();
+                temp_model.eval()
                 val_loss = 0
                 with torch.no_grad():
                     for batch in val_loader:
-                        batch = batch.to(self.device);
-                        reconstructed = temp_model(batch);
-                        loss = temp_criterion(reconstructed, batch);
+                        batch = batch.to(self.device)
+                        reconstructed = temp_model(batch)
+                        loss = temp_criterion(reconstructed, batch)
                         val_loss += loss.item()
                 val_loss /= len(val_loader) if len(val_loader) > 0 else 1
             return val_loss
 
-        study = optuna.create_study(direction='minimize');
+        study = optuna.create_study(direction='minimize')
         study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT)
-        self.best_params = study.best_params;
+        self.best_params = study.best_params
         return study.best_params
 
     def train(self, train_loader, val_loader, scaler, use_optuna=True):
-        print("\n" + "=" * 70);
-        print("🚀 TRAINING AUTOENCODER");
+        print("\n" + "=" * 70)
+        print("🚀 TRAINING AUTOENCODER")
         print("=" * 70)
         self.scaler = scaler
         if use_optuna and Config.USE_OPTUNA:
             best_params = self.optimize_hyperparameters(train_loader, val_loader, scaler)
-            self.latent_dim = best_params['latent_dim'];
+            self.latent_dim = best_params['latent_dim']
             self.hidden_layers = [best_params['hidden_layer_1'], best_params['hidden_layer_2'],
-                                  best_params['hidden_layer_3']];
-            self.dropout_rate = best_params['dropout_rate'];
+                                  best_params['hidden_layer_3']]
+            self.dropout_rate = best_params['dropout_rate']
             self.learning_rate = best_params['learning_rate']
-        self.build_model()  # Build model with chosen params
-        best_val_loss = float('inf');
-        patience = 10;
-        patience_counter = 0;
+        self.build_model()
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
         train_losses, val_losses = [], []
         for epoch in tqdm(range(Config.AUTOENCODER_EPOCHS), desc="Training Autoencoder"):
-            self.model.train();
+            self.model.train()
             train_loss = 0
             for batch in train_loader:
-                batch = batch.to(self.device);
-                self.optimizer.zero_grad();
-                reconstructed = self.model(batch);
-                loss = self.criterion(reconstructed, batch);
-                loss.backward();
-                self.optimizer.step();
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                reconstructed = self.model(batch)
+                loss = self.criterion(reconstructed, batch)
+                loss.backward()
+                self.optimizer.step()
                 train_loss += loss.item()
             train_losses.append(train_loss / len(train_loader))
-            self.model.eval();
+            self.model.eval()
             val_loss = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    batch = batch.to(self.device);
-                    reconstructed = self.model(batch);
-                    loss = self.criterion(reconstructed, batch);
+                    batch = batch.to(self.device)
+                    reconstructed = self.model(batch)
+                    loss = self.criterion(reconstructed, batch)
                     val_loss += loss.item()
-            val_loss /= len(val_loader) if len(val_loader) > 0 else 1;
+            val_loss /= len(val_loader) if len(val_loader) > 0 else 1
             val_losses.append(val_loss)
             if val_loss < best_val_loss:
-                best_val_loss = val_loss;
-                patience_counter = 0;
+                best_val_loss = val_loss
+                patience_counter = 0
                 self.save_model('best_autoencoder.pth')
             else:
                 patience_counter += 1
-                if patience_counter >= patience: print(f"\n  Early stopping at epoch {epoch + 1}"); break
+                if patience_counter >= patience:
+                    print(f"\n  Early stopping at epoch {epoch + 1}")
+                    break
         self.load_model('best_autoencoder.pth')
         self._set_threshold(val_loader)
         self._plot_training_history(train_losses, val_losses)
 
     def _set_threshold(self, val_loader):
-        self.model.eval();
+        self.model.eval()
         errors = []
         with torch.no_grad():
             for batch in val_loader:
-                batch = batch.to(self.device);
-                reconstructed = self.model(batch);
-                error = torch.mean((batch - reconstructed) ** 2, dim=1);
+                batch = batch.to(self.device)
+                reconstructed = self.model(batch)
+                error = torch.mean((batch - reconstructed) ** 2, dim=1)
                 errors.extend(error.cpu().numpy())
         if errors:
             self.threshold = np.percentile(errors, Config.ANOMALY_THRESHOLD_PERCENTILE)
@@ -238,35 +235,35 @@ class AutoencoderModel:
             self.threshold = float('inf')
 
     def detect_anomalies(self, data_loader):
-        self.model.eval();
+        self.model.eval()
         all_errors, all_predictions = [], []
         with torch.no_grad():
             for batch in tqdm(data_loader, desc="Processing batches"):
                 if isinstance(batch, tuple): batch = batch[0]
-                batch = batch.to(self.device);
-                reconstructed = self.model(batch);
-                errors = torch.mean((batch - reconstructed) ** 2, dim=1);
-                all_errors.extend(errors.cpu().numpy());
-                predictions = (errors > self.threshold).cpu().numpy();
+                batch = batch.to(self.device)
+                reconstructed = self.model(batch)
+                errors = torch.mean((batch - reconstructed) ** 2, dim=1)
+                all_errors.extend(errors.cpu().numpy())
+                predictions = (errors > self.threshold).cpu().numpy()
                 all_predictions.extend(predictions)
         return np.array(all_predictions), np.array(all_errors)
 
     def _plot_training_history(self, train_losses, val_losses):
-        plt.figure(figsize=(10, 6));
-        plt.plot(train_losses, label='Train Loss');
-        plt.plot(val_losses, label='Validation Loss');
-        plt.xlabel('Epoch');
-        plt.ylabel('Loss (MSE)');
-        plt.title('Autoencoder Training History');
-        plt.legend();
-        plt.grid(True);
-        plt.tight_layout();
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'autoencoder_training.png'));
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.title('Autoencoder Training History')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(Config.RESULTS_DIR, 'autoencoder_training.png'))
         plt.close()
 
 
 if __name__ == "__main__":
-    Config.print_mode_info();
+    Config.print_mode_info()
     Config.set_seeds()
     train_loader, val_loader, scaler, final_feature_list = get_data_for_autoencoder()
     if final_feature_list and len(train_loader.dataset) > 0:

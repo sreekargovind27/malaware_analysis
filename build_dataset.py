@@ -1,6 +1,7 @@
 """
-OPTIMIZED: Parallel processing + faster I/O + better chunking
-UPDATED: Implemented a two-pass "budgeted" sampling strategy to preserve small files.
+This script builds a preprocessed, feature-engineered dataset from raw CSV files.
+It uses parallel processing for efficiency and a two-pass "budgeted" sampling
+strategy to ensure that smaller data files are fully included while larger files are sampled proportionally.
 """
 import glob
 import os
@@ -16,19 +17,16 @@ from tqdm import tqdm
 
 from config import Config
 
-# ==================== CONSTANTS ====================
 CHUNK_SIZE = 1_000_000
 MAX_WORKERS = min(16, cpu_count() - 1)
-# Any file with fewer rows than this will be included in its entirety in the final sample.
-SMALL_FILE_THRESHOLD = 5_000_000
+SMALL_FILE_THRESHOLD = 5_000_000  # Files with fewer rows than this are included in their entirety.
 
 
-# ==================== MODULE-LEVEL FUNCTIONS FOR PICKLING ====================
 def scan_single_file(file_path):
-    """Scan one file for categorical values."""
+    """Scans a single file to extract unique values from categorical columns."""
     proto_values, conn_state_values = set(), set()
     try:
-        # Added comment='#' to handle files that might have commented header lines
+        # Handles files that may have commented header lines.
         df_sample = pd.read_csv(file_path, usecols=['proto', 'conn_state'], low_memory=False, on_bad_lines='skip',
                                 comment='#')
         proto_values.update(
@@ -40,11 +38,8 @@ def scan_single_file(file_path):
     return proto_values, conn_state_values
 
 
-# ============================================================================
-# THIS FUNCTION WAS MISSING. IT HAS BEEN ADDED BACK.
-# ============================================================================
 def scan_categorical_values(csv_files):
-    """OPTIMIZED: Parallel scanning of categorical values."""
+    """Scans all CSV files in parallel to build a schema of all possible categorical values."""
     print("\n" + "=" * 70)
     print("🔍 SCANNING FILES FOR CATEGORICAL VALUES (Parallel)")
     print("=" * 70)
@@ -63,13 +58,8 @@ def scan_categorical_values(csv_files):
     return {'proto': sorted(all_proto_values), 'conn_state': sorted(all_conn_state_values)}
 
 
-# ============================================================================
-# END OF ADDED FUNCTION
-# ============================================================================
-
-
 def process_single_csv(args):
-    """Process one CSV file."""
+    """Processes a single CSV file, handling feature engineering and data cleaning."""
     file_path, all_categorical_values = args
     base_name = os.path.basename(file_path)
     file_key = base_name.replace('.csv', '')
@@ -77,7 +67,7 @@ def process_single_csv(args):
 
 
 def extract_ip_features(ip_series):
-    """Extract features from IP addresses."""
+    """Extracts network-related features from a series of IP addresses."""
 
     def parse_ip(ip_str):
         if pd.isna(ip_str) or ip_str in ['-', ''] or ':' in str(ip_str): return [0, 0, 0, 0, 0]
@@ -98,7 +88,7 @@ def extract_ip_features(ip_series):
 
 
 def _clean_and_expand_labels(df):
-    """Clean and expand label columns."""
+    """Cleans and expands the 'label' and 'detailed-label' columns into structured target columns."""
     has_label_col = 'label' in df.columns and 'detailed-label' in df.columns
     if has_label_col:
         combined_str = (df['label'].astype(str).fillna('') + ' ' + df['detailed-label'].astype(str).fillna(
@@ -158,17 +148,16 @@ def _clean_and_expand_labels(df):
 
 
 def _preprocess_partition(df, all_categorical_values):
-    """Preprocess a single partition."""
+    """Applies all feature engineering and cleaning steps to a single data partition (chunk)."""
     METADATA_COLUMNS = ['Source_Folder', 'ts', 'uid', 'id.orig_h', 'id.orig_p', 'id.resp_h', 'id.resp_p', 'label',
                         'detailed-label']
     ip_columns_to_keep = ['id.orig_h', 'id.resp_h', 'id.resp_p']
     if 'label' in df.columns and 'detailed-label' in df.columns: df = _clean_and_expand_labels(df)
 
-    # Drop metadata, but KEEP local_orig/local_resp if they exist, to be processed later
+    # Keep specific IP-related columns for later processing.
     to_drop = [col for col in METADATA_COLUMNS if col in df.columns and col not in ip_columns_to_keep]
     df = df.drop(columns=to_drop, errors='ignore')
 
-    # Process local_orig/resp if they exist in the chunk
     if 'local_orig' in df.columns:
         df['local_orig'] = pd.to_numeric(df['local_orig'], errors='coerce').fillna(0).astype(np.int8)
     if 'local_resp' in df.columns:
@@ -176,14 +165,16 @@ def _preprocess_partition(df, all_categorical_values):
 
     for col in Config.BASE_NUMERICAL_FEATURES:
         if col not in df.columns:
-            df[col] = 0;
-            df[f'{col}_was_missing'] = 1;
+            df[col] = 0
+            df[f'{col}_was_missing'] = 1
             continue
         df[f'{col}_was_missing'] = df[col].isna().astype(np.int8)
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).clip(lower=0)
         if col in Config.SKEWED_NUMERICAL_FEATURES: df[col] = np.log1p(df[col])
     for col in Config.CATEGORICAL_LABEL_ENCODE:
-        if col not in df.columns: df[col] = 0; continue
+        if col not in df.columns:
+            df[col] = 0
+            continue
         df[col] = df[col].fillna('unknown').astype(str).replace(['', '-', 'nan', 'None'], 'unknown')
         df[col] = pd.Categorical(df[col]).codes.astype(np.int32)
     for col in Config.CATEGORICAL_ONE_HOT_ENCODE:
@@ -192,53 +183,53 @@ def _preprocess_partition(df, all_categorical_values):
         for category in all_categorical_values.get(col, []): df[f'{col}_{category}'] = (df[col] == category).astype(
             np.int8)
         df = df.drop(columns=[col])
-    df['is_port_23'] = (df['id.resp_p'] == 23).astype(np.int8);
+    df['is_port_23'] = (df['id.resp_p'] == 23).astype(np.int8)
     df['is_port_22'] = (df['id.resp_p'] == 22).astype(np.int8)
-    df['is_S0_state'] = df.get('conn_state_S0', 0);
-    df['is_telnet'] = 0;
+    df['is_S0_state'] = df.get('conn_state_S0', 0)
+    df['is_telnet'] = 0
     df['is_unknown_service'] = 0
-    total_bytes = df['orig_bytes'] + df['resp_bytes'];
+    total_bytes = df['orig_bytes'] + df['resp_bytes']
     total_packets = df['orig_pkts'] + df['resp_pkts']
-    df['upload_ratio'] = df['orig_bytes'] / (total_bytes + 1e-9);
+    df['upload_ratio'] = df['orig_bytes'] / (total_bytes + 1e-9)
     df['bytes_per_packet'] = total_bytes / (total_packets + 1e-9)
-    safe_duration = np.expm1(df['duration']).clip(lower=0.001);
+    safe_duration = np.expm1(df['duration']).clip(lower=0.001)
     df['packet_rate'] = (total_packets / safe_duration).clip(upper=10000)
     df['is_scanning_signature'] = ((df['is_port_23'] == 1) & (df['is_S0_state'] == 1)).astype(np.int8)
     df['suspicious_score'] = df['is_port_23'] * 40 + df['is_S0_state'] * 30 + df['is_port_22'] * 25
     if 'id.resp_h' in df.columns:
-        resp_ip_features = extract_ip_features(df['id.resp_h']);
+        resp_ip_features = extract_ip_features(df['id.resp_h'])
         resp_ip_features.columns = ['resp_' + col for col in resp_ip_features.columns]
-        df = pd.concat([df, resp_ip_features], axis=1);
+        df = pd.concat([df, resp_ip_features], axis=1)
         df = df.drop(columns=['id.resp_h'])
     if 'id.orig_h' in df.columns:
-        orig_ip_features = extract_ip_features(df['id.orig_h']);
+        orig_ip_features = extract_ip_features(df['id.orig_h'])
         orig_ip_features.columns = ['orig_' + col for col in orig_ip_features.columns]
-        df = pd.concat([df, orig_ip_features], axis=1);
+        df = pd.concat([df, orig_ip_features], axis=1)
         df = df.drop(columns=['id.orig_h'])
     df = df.drop(columns=['id.resp_p'], errors='ignore')
     return df
 
 
 def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values):
-    """OPTIMIZED: Write Parquet instead of CSV"""
+    """Reads a large CSV in chunks, processes each chunk, and saves the result as a Parquet file."""
     output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR, os.path.basename(file_path).replace('.csv', '.parquet'))
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"\n  📄 {os.path.basename(file_path)} ({file_size_mb:.1f} MB)")
-    t_start = time.time();
-    chunks_list = [];
+    t_start = time.time()
+    chunks_list = []
     total_rows = 0
-    # Added comment='#' to handle files that might have commented header lines
+    # Handles files that may have commented header lines.
     for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE, low_memory=False, on_bad_lines='skip', comment='#'):
         processed = _preprocess_partition(chunk, all_categorical_values)
         ground_truth_family = Config.FILENAME_TO_FAMILY_MAP.get(file_key, 'Unknown')
         processed[Config.FAMILY_TARGET_COL] = ground_truth_family
         if ground_truth_family == 'Benign':
-            processed[Config.TARGET_COL] = 'Benign';
+            processed[Config.TARGET_COL] = 'Benign'
             processed[Config.DETAILED_TARGET_COL] = 'Benign'
         else:
             if Config.TARGET_COL not in processed.columns: processed[Config.TARGET_COL] = 'Malicious'
             if Config.DETAILED_TARGET_COL not in processed.columns: processed[Config.DETAILED_TARGET_COL] = 'Unknown'
-        chunks_list.append(processed);
+        chunks_list.append(processed)
         total_rows += len(processed)
     if chunks_list:
         final_df = pd.concat(chunks_list, ignore_index=True)
@@ -250,7 +241,7 @@ def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
 
 
 def build_engineered_dataset():
-    """Builds the final dataset with a smart, budgeted sampling strategy."""
+    """Builds the final dataset using a two-stage process: parallel processing and budgeted sampling."""
     print("\n" + "=" * 70)
     print("🚀 STARTING OPTIMIZED DATASET BUILD PIPELINE")
     print("=" * 70)
@@ -263,17 +254,16 @@ def build_engineered_dataset():
     overall_start = time.time()
     csv_files = glob.glob(os.path.join(Config.RAW_DIR_ORIGINAL, '*.csv'))
     if not csv_files:
-        print(f"❌ Error: No CSV files found in '{Config.RAW_DIR_ORIGINAL}'");
+        print(f"❌ Error: No CSV files found in '{Config.RAW_DIR_ORIGINAL}'")
         return
 
     print(f"\n📁 Found {len(csv_files)} CSV files to process")
     all_categorical_values = scan_categorical_values(csv_files)
 
-    # ==================== STAGE 1: PARALLEL FILE PROCESSING ====================
     print("\n" + "=" * 70)
     print("🔍 STAGE 1: PROCESSING FILES (PARALLEL)")
     print("=" * 70)
-    stage1_start = time.time();
+    stage1_start = time.time()
     files_processed, files_skipped = 0, 0
     files_to_process = []
     for file_path in csv_files:
@@ -290,7 +280,8 @@ def build_engineered_dataset():
             futures = {executor.submit(process_single_csv, args): args for args in args_list}
             for future in as_completed(futures):
                 try:
-                    future.result(); files_processed += 1
+                    future.result()
+                    files_processed += 1
                 except Exception as e:
                     print(f"    ❌ ERROR: {e}")
 
@@ -302,23 +293,24 @@ def build_engineered_dataset():
     print(f"   ⭐️ Skipped: {files_skipped} files")
     print("=" * 70)
 
-    # ==================== STAGE 2: BUDGETED SAMPLING ====================
     print("\n" + "=" * 70)
     print("🔍 STAGE 2: COMBINING WITH BUDGETED SAMPLING")
     print("=" * 70)
     stage2_start = time.time()
     split_files = glob.glob(os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet'))
-    if not split_files: print("❌ No engineered files found"); return
+    if not split_files:
+        print("❌ No engineered files found")
+        return
 
     print(f"📁 Found {len(split_files)} processed files to sample from")
 
-    # Pass 1: Identify small/large files and calculate budget
+    # Pass 1: Identify small/large files and calculate sampling budget.
     small_files_to_keep, large_files_to_sample = [], []
     rows_from_small_files, total_rows_in_large_files = 0, 0
 
     print("⏳ Pass 1: Classifying files and calculating row counts...")
     for pq_file in tqdm(split_files, desc="Analyzing files"):
-        # Read only one column for speed to get the row count
+        # Reading a single column is faster for getting row counts.
         row_count = len(pd.read_parquet(pq_file, columns=['label']))
         if row_count < SMALL_FILE_THRESHOLD:
             small_files_to_keep.append(pq_file)
@@ -334,7 +326,7 @@ def build_engineered_dataset():
 
     remaining_rows_to_sample = Config.SAMPLE_SIZE - rows_from_small_files
 
-    # Pass 2: Load/sample files based on the budget
+    # Pass 2: Load data from small files and sample from large files.
     all_samples = []
     if remaining_rows_to_sample <= 0:
         print(
@@ -343,11 +335,9 @@ def build_engineered_dataset():
         all_samples.append(temp_df.sample(n=Config.SAMPLE_SIZE, random_state=Config.RANDOM_STATE))
     else:
         print(f"⏳ Pass 2: Loading all small files and sampling {remaining_rows_to_sample:,} rows from large files...")
-        # Load 100% of all small files
         for f in tqdm(small_files_to_keep, desc="Loading small files"):
             all_samples.append(pd.read_parquet(f))
 
-        # Sample proportionally from large files to fill the budget
         if total_rows_in_large_files > 0:
             large_file_frac = remaining_rows_to_sample / total_rows_in_large_files
             for pq_file, row_count in tqdm(large_files_to_sample, desc="Sampling large files"):
@@ -361,18 +351,16 @@ def build_engineered_dataset():
     del all_samples
     print(f"✓ Final dataset created with {len(final_df):,} rows.")
 
-    # FIX: Explicitly correct the data types for local_orig and local_resp AFTER concatenation.
-    # This prevents them from being upcast to 'object' dtype, which causes errors in LightGBM.
+    # Correct data types that may have been upcast during concatenation.
     if 'local_orig' in final_df.columns:
         final_df['local_orig'] = pd.to_numeric(final_df['local_orig'], errors='coerce').fillna(0).astype(np.int8)
     if 'local_resp' in final_df.columns:
         final_df['local_resp'] = pd.to_numeric(final_df['local_resp'], errors='coerce').fillna(0).astype(np.int8)
 
-    # Final processing and saving
     print("\n⏳ Building final feature list...")
     target_cols = [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL, 'attack_subtype']
     final_feature_list = [col for col in final_df.columns if col not in target_cols]
-    final_df = final_df[final_feature_list + target_cols]  # Ensure column order
+    final_df = final_df[final_feature_list + target_cols]  # Ensure consistent column order.
     joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
     print(f"✓ Feature list saved with {len(final_feature_list)} features.")
 

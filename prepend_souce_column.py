@@ -1,9 +1,9 @@
 """
-One-time utility script to fix the raw data files.
+A utility script to preprocess raw CSV data by adding a 'Source_Folder' column.
 
-This script reads each CSV file from a source directory (e.g., 'data/raw_medium'),
-prepends a new 'Source_Folder' column populated with the filename,
-and saves the corrected 23-column file to the final destination directory (e.g., 'data/raw').
+This script iterates through CSV files in a specified source directory,
+adds a new column at the beginning of each file containing the original filename,
+and saves the modified file to a destination directory.
 """
 
 import os
@@ -11,24 +11,20 @@ import os
 import pandas as pd
 from tqdm import tqdm
 
-# --- CONFIGURE YOUR PATHS HERE ---
+# Configure the source and destination paths for the data files.
 SOURCE_DIRECTORY = 'data/raw_medium/'
 DESTINATION_DIRECTORY = 'data/raw/'
 
 
-# -----------------------------------
-
 def add_source_folder_column():
-    """Reads files from SOURCE_DIRECTORY, adds the source column, and saves to DESTINATION_DIRECTORY."""
+    """Reads files, adds the source column, and saves the modified versions."""
 
     print("=" * 60)
     print("Fixing Raw CSVs: Adding 'Source_Folder' Column")
     print("=" * 60)
 
-    # Ensure the destination directory exists
     os.makedirs(DESTINATION_DIRECTORY, exist_ok=True)
 
-    # Find all CSV files in the source directory
     try:
         csv_files = [f for f in os.listdir(SOURCE_DIRECTORY) if f.endswith('.csv')]
         if not csv_files:
@@ -46,16 +42,14 @@ def add_source_folder_column():
         destination_path = os.path.join(DESTINATION_DIRECTORY, filename)
 
         try:
-            # Read the CSV file
             df = pd.read_csv(source_path)
 
-            # The value for the new column is the filename without the '.csv' extension
+            # Use the filename (without extension) as the value for the new column.
             source_folder_value = filename.replace('.csv', '')
 
-            # Insert the new 'Source_Folder' column at the beginning (position 0)
+            # Insert the new column at the beginning of the DataFrame.
             df.insert(0, 'Source_Folder', source_folder_value)
 
-            # Save the corrected DataFrame to the destination
             df.to_csv(destination_path, index=False)
 
         except Exception as e:
@@ -63,7 +57,7 @@ def add_source_folder_column():
             continue
 
     print("\n" + "=" * 60)
-    print("✓ All files successfully converted to the 23-column format.")
+    print("✓ All files successfully converted.")
     print("=" * 60)
 
 
