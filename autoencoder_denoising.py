@@ -1,14 +1,14 @@
 """
 Denoising Autoencoder for Anomaly Detection
-Variation: Adds noise during training for better robustness
-Uses Optuna-optimized hyperparameters for best performance
-Contributor: Nidhi Rajani
+Variation: Adds noise during training for better robustness.
+This version includes a full Optuna hyperparameter search.
 """
 
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+import optuna
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -18,15 +18,33 @@ from data_loader import get_data_for_autoencoder
 
 
 class DenoisingAutoencoder(nn.Module):
-    """Denoising Autoencoder with noise injection and optimized architecture"""
+    """Flexible Denoising Autoencoder for Optuna tuning."""
 
-    def __init__(self, input_dim, noise_factor=0.15):
+    def __init__(self, input_dim, hidden_layers, latent_dim, dropout_rate, noise_factor=0.15):
         super(DenoisingAutoencoder, self).__init__()
         self.noise_factor = noise_factor
-        self.encoder = nn.Sequential(nn.Linear(input_dim, 116), nn.ReLU(), nn.Dropout(0.01), nn.Linear(116, 45),
-                                     nn.ReLU(), nn.Dropout(0.01), nn.Linear(45, 25), nn.ReLU(), nn.Linear(25, 5))
-        self.decoder = nn.Sequential(nn.Linear(5, 25), nn.ReLU(), nn.Linear(25, 45), nn.ReLU(), nn.Dropout(0.01),
-                                     nn.Linear(45, 116), nn.ReLU(), nn.Dropout(0.01), nn.Linear(116, input_dim))
+
+        # Build encoder
+        encoder_layers = [];
+        prev_dim = input_dim
+        for hidden_dim in hidden_layers:
+            encoder_layers.append(nn.Linear(prev_dim, hidden_dim));
+            encoder_layers.append(nn.ReLU())
+            if dropout_rate > 0: encoder_layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Build decoder (mirror)
+        decoder_layers = [];
+        prev_dim = latent_dim
+        for hidden_dim in reversed(hidden_layers):
+            decoder_layers.append(nn.Linear(prev_dim, hidden_dim));
+            decoder_layers.append(nn.ReLU())
+            if dropout_rate > 0: decoder_layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        decoder_layers.append(nn.Linear(prev_dim, input_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def add_noise(self, x):
         noise = torch.randn_like(x) * self.noise_factor;
@@ -40,61 +58,148 @@ class DenoisingAutoencoder(nn.Module):
 
 
 class DenoisingAutoencoderModel:
-    """Denoising Autoencoder wrapper with optimized hyperparameters"""
+    """Wrapper for the Denoising Autoencoder with a full training pipeline."""
 
-    def __init__(self, input_dim, noise_factor=0.15):
+    def __init__(self, input_dim):
         self.device = Config.DEVICE
-        self.model = DenoisingAutoencoder(input_dim, noise_factor).to(self.device)
+        self.input_dim = input_dim
+        self.model = None;
+        self.optimizer = None;
         self.criterion = nn.MSELoss()
-        optimal_lr = 0.008123
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=optimal_lr)
+        self.scaler = None;
+        self.best_params = None;
         self.threshold = None
-        self.scaler = None
-        print(f"Denoising Autoencoder initialized on {self.device}")
-        print(f"  Input dim: {input_dim}, Noise Factor: {noise_factor}, LR: {optimal_lr}")
+        # Default attributes
+        self.hidden_layers = [116, 45, 25];
+        self.latent_dim = 5
+        self.dropout_rate = 0.01;
+        self.learning_rate = 0.001;
+        self.noise_factor = 0.15
+        print(f"Denoising Autoencoder wrapper initialized on {self.device}")
 
-    def save_model(self, filename):
-        """Save model, including scaler."""
-        filepath = os.path.join(Config.MODELS_DIR, filename)
-        torch.save({'model_state': self.model.state_dict(), 'threshold': self.threshold, 'scaler': self.scaler},
-                   filepath)
+    def build_model(self):
+        """Builds or rebuilds the model based on current attributes."""
+        print(
+            f"\n🏗️  Building Denoising AE with architecture: {self.hidden_layers} -> {self.latent_dim}, Noise: {self.noise_factor}")
+        self.model = DenoisingAutoencoder(
+            self.input_dim, self.hidden_layers, self.latent_dim,
+            self.dropout_rate, self.noise_factor
+        ).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
     def load_model(self, filename):
-        """Load model, raising error if scaler is missing."""
         filepath = os.path.join(Config.MODELS_DIR, filename)
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"❌ Model file {filepath} not found")
+        if not os.path.exists(filepath): raise FileNotFoundError(f"❌ Model file {filepath} not found")
 
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state'])
-        self.threshold = checkpoint.get('threshold')
-        if 'scaler' not in checkpoint:
-            raise KeyError("❌ Scaler not found in the checkpoint file. Please retrain the model.")
+        print("💾 Reading architecture from checkpoint...")
+        self.hidden_layers = checkpoint['hidden_layers'];
+        self.latent_dim = checkpoint['latent_dim']
+        self.dropout_rate = checkpoint['dropout_rate'];
+        self.learning_rate = checkpoint['learning_rate']
+        self.noise_factor = checkpoint['noise_factor'];
         self.scaler = checkpoint['scaler']
-        print("✅ Denoising model and scaler loaded successfully.")
+        self.threshold = checkpoint.get('threshold');
+        self.best_params = checkpoint.get('best_params')
 
-    def train(self, train_loader, val_loader, scaler):
+        self.build_model()
+        self.model.load_state_dict(checkpoint['model_state'])
+        print("✅ Model state loaded successfully into matching architecture.")
+
+    def save_model(self, filename):
+        filepath = os.path.join(Config.MODELS_DIR, filename)
+        if self.model is None: raise RuntimeError("Model has not been built yet.")
+        torch.save({
+            'model_state': self.model.state_dict(), 'scaler': self.scaler, 'threshold': self.threshold,
+            'hidden_layers': self.hidden_layers, 'latent_dim': self.latent_dim,
+            'dropout_rate': self.dropout_rate, 'learning_rate': self.learning_rate,
+            'noise_factor': self.noise_factor, 'best_params': self.best_params
+        }, filepath)
+
+    def optimize_hyperparameters(self, train_loader, val_loader):
+        print("\n" + "=" * 70);
+        print("🔍 HYPERPARAMETER OPTIMIZATION (Denoising AE)");
+        print("=" * 70)
+        if not Config.USE_OPTUNA:
+            print("\n⭐️ Optuna disabled, using default parameters.")
+            return {'n_layers': 3, 'layer_1': 116, 'layer_2': 45, 'layer_3': 25, 'latent_dim': 5, 'dropout_rate': 0.01,
+                    'learning_rate': 0.001, 'noise_factor': 0.15}
+
+        def objective(trial):
+            n_layers = trial.suggest_int('n_layers', 2, 4)
+            hidden_layers = [trial.suggest_categorical(f'layer_{i + 1}', [32, 64, 128]) for i in range(n_layers)]
+            latent_dim = trial.suggest_int('latent_dim', 4, 16)
+            dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.4)
+            learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+            noise_factor = trial.suggest_float('noise_factor', 0.05, 0.3)
+
+            temp_model = DenoisingAutoencoder(self.input_dim, hidden_layers, latent_dim, dropout_rate, noise_factor).to(
+                self.device)
+            temp_optimizer = torch.optim.Adam(temp_model.parameters(), lr=learning_rate)
+            temp_criterion = nn.MSELoss()
+
+            best_val_loss = float('inf')
+            for epoch in range(15):  # Short training for each trial
+                temp_model.train()
+                for batch in train_loader:
+                    batch = batch.to(self.device);
+                    temp_optimizer.zero_grad();
+                    reconstructed = temp_model(batch, add_noise=True);
+                    loss = temp_criterion(reconstructed, batch);
+                    loss.backward();
+                    temp_optimizer.step()
+
+                temp_model.eval();
+                val_loss = 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        batch = batch.to(self.device);
+                        reconstructed = temp_model(batch, add_noise=False);
+                        loss = temp_criterion(reconstructed, batch);
+                        val_loss += loss.item()
+                val_loss /= len(val_loader) if len(val_loader) > 0 else 1
+                if val_loss < best_val_loss: best_val_loss = val_loss
+            return best_val_loss
+
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=Config.OPTUNA_N_TRIALS, timeout=Config.OPTUNA_TIMEOUT,
+                       show_progress_bar=True)
+        self.best_params = study.best_params
+        return study.best_params
+
+    def train(self, train_loader, val_loader, scaler, use_optuna=True):
         print("\n" + "=" * 70);
         print("🚀 TRAINING DENOISING AUTOENCODER");
         print("=" * 70)
         self.scaler = scaler
+
+        if use_optuna and Config.USE_OPTUNA:
+            best_params = self.optimize_hyperparameters(train_loader, val_loader)
+            n_layers = best_params.pop('n_layers')
+            # Use .get() as a safeguard in case Optuna prunes before suggesting all layers
+            self.hidden_layers = [best_params.get(f'layer_{i + 1}', 64) for i in range(n_layers)]
+            self.latent_dim = best_params['latent_dim']
+            self.dropout_rate = best_params['dropout_rate']
+            self.learning_rate = best_params['learning_rate']
+            self.noise_factor = best_params['noise_factor']
+
+        self.build_model()
         best_val_loss = float('inf');
         patience = 10;
-        patience_counter = 0;
+        patience_counter = 0
         train_losses, val_losses = [], []
 
-        # Main training loop with full tqdm progress bar
         progress_bar = tqdm(range(Config.AUTOENCODER_EPOCHS), desc="Training Denoising AE")
         for epoch in progress_bar:
             self.model.train();
             train_loss = 0
             for batch in train_loader:
                 batch = batch.to(self.device);
-                self.optimizer.zero_grad()
-                reconstructed = self.model(batch, add_noise=True)
+                self.optimizer.zero_grad();
+                reconstructed = self.model(batch, add_noise=True);
                 loss = self.criterion(reconstructed, batch);
                 loss.backward();
-                self.optimizer.step()
+                self.optimizer.step();
                 train_loss += loss.item()
             avg_train_loss = train_loss / len(train_loader)
             train_losses.append(avg_train_loss)
@@ -104,18 +209,17 @@ class DenoisingAutoencoderModel:
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(self.device);
-                    reconstructed = self.model(batch, add_noise=False)
+                    reconstructed = self.model(batch, add_noise=False);
                     loss = self.criterion(reconstructed, batch);
                     val_loss += loss.item()
             avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 1
             val_losses.append(avg_val_loss)
 
-            # Update the progress bar with the latest loss values
             progress_bar.set_postfix(train_loss=f"{avg_train_loss:.6f}", val_loss=f"{avg_val_loss:.6f}")
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss;
-                patience_counter = 0
+                patience_counter = 0;
                 self.save_model('best_denoising_autoencoder.pth')
             else:
                 patience_counter += 1
@@ -177,7 +281,7 @@ if __name__ == "__main__":
     train_loader, val_loader, scaler, final_feature_list = get_data_for_autoencoder()
     if final_feature_list and len(train_loader.dataset) > 0:
         input_dim = len(final_feature_list)
-        denoising_ae = DenoisingAutoencoderModel(input_dim, noise_factor=0.15)
-        denoising_ae.train(train_loader, val_loader, scaler)
+        denoising_ae = DenoisingAutoencoderModel(input_dim)
+        denoising_ae.train(train_loader, val_loader, scaler, use_optuna=True)
         denoising_ae.save_model('denoising_autoencoder_final.pth')
         print("\n✅ Denoising Autoencoder training complete and final model saved.")
