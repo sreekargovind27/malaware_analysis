@@ -14,7 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 from config import Config
-from data_loader import get_data_for_clustering, load_engineered_data
+from models.data_loader import get_data_for_clustering, load_engineered_data
 
 
 class KMeansClustering:

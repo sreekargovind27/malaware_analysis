@@ -53,7 +53,7 @@ def load_engineered_data():
 
 def load_master_train_set():
     """Loads the pre-split training dataset."""
-    path = 'data/master_splits/train_set.parquet'
+    path = Config.TRAIN_SET_PATH
     print(f"\n📂 Loading MASTER TRAIN set from: {path}")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Master train set not found at '{path}'. Please run 'create_splits.py' first.")
@@ -64,7 +64,7 @@ def load_master_train_set():
 
 def load_master_test_set():
     """Loads the pre-split test dataset."""
-    path = 'data/master_splits/test_set.parquet'
+    path = Config.TEST_SET_PATH
     print(f"\n📂 Loading MASTER TEST set from: {path}")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Master test set not found at '{path}'. Please run 'create_splits.py' first.")
@@ -178,7 +178,8 @@ def get_data_for_multiclass():
     X_test = test_df_filtered[features]
     y_test = le.transform(test_df_filtered[Config.DETAILED_TARGET_COL])
 
-    joblib.dump(le, 'data/master_splits/multiclass_label_encoder.joblib')
+    encoder_path = os.path.join(Config.SPLITS_DIR, 'multiclass_label_encoder.joblib')
+    joblib.dump(le, encoder_path)
     print("✓ Label encoder saved.")
     print(f"\n✓ Multiclass data ready.\n  - Train samples: {len(X_train):,}\n  - Test samples:  {len(X_test):,}")
     print("=" * 70)
@@ -212,7 +213,9 @@ def get_data_for_virus():
     X_test = test_malicious_filtered[features]
     y_test = le.transform(test_malicious_filtered[Config.FAMILY_TARGET_COL])
 
-    joblib.dump(le, 'data/master_splits/virus_label_encoder.joblib')
+    encoder_path = os.path.join(Config.SPLITS_DIR, 'virus_label_encoder.joblib')
+    joblib.dump(le, encoder_path)
+
     print("✓ Label encoder saved.")
     print(f"\n✓ Virus data ready.\n  - Train samples: {len(X_train):,}\n  - Test samples:  {len(X_test):,}")
     print("=" * 70)

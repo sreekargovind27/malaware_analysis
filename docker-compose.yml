@@ -1,0 +1,17 @@
+services:
+  stage1-analysis:
+    build: .
+    container_name: iot23-stage1
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs                        # ✅ CHANGED: Single outputs folder
+      - ./analysis:/app/analysis
+      - ./models:/app/models                           # ✅ ADDED: Mount models code
+      - ./scripts:/app/scripts                         # ✅ ADDED: Mount scripts
+      - ./config.py:/app/config.py
+    environment:
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+    command: sh -c "python analysis/stage1/run_stage1.py && python analysis/stage2/run_stage2.py"

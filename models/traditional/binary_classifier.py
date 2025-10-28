@@ -17,7 +17,7 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from sklearn.model_selection import train_test_split
 
 from config import Config
-from data_loader import get_data_for_binary
+from models.data_loader import get_data_for_binary
 
 
 class BinaryClassifier:

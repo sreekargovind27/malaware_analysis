@@ -15,7 +15,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from config import Config
-from data_loader import get_data_for_autoencoder
+from models.data_loader import get_data_for_autoencoder
 
 
 class Autoencoder(nn.Module):

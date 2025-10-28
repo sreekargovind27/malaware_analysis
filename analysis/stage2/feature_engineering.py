@@ -382,6 +382,14 @@ def build_engineered_dataset():
     print(f"⏱️  Total: {total_time:.2f}s ({total_time / 60:.1f} min)")
     print(f"📊 Final rows: {len(final_df):,}")
     print(f"📊 Features: {len(final_feature_list)}")
+
+    # Clean up intermediate files
+    print("\n🗑️  Cleaning up intermediate files...")
+    import shutil
+    if os.path.exists(Config.ENGINEERED_SPLIT_DIR):
+        shutil.rmtree(Config.ENGINEERED_SPLIT_DIR)
+        print(f"✅ Removed intermediate directory: {Config.ENGINEERED_SPLIT_DIR}")
+
     print("=" * 70)
 
 

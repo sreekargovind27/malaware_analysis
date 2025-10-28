@@ -8,7 +8,7 @@ import os
 import pandas as pd
 
 from config import Config
-
+from models.data_loader import load_engineered_data
 
 def check_engineered_data_quality():
     """Checks the data quality of the final engineered Parquet file."""
@@ -21,8 +21,8 @@ def check_engineered_data_quality():
         print("Please run 'build_dataset.py' first.")
         return
 
-    print(f"\nChecking '{Config.ENGINEERED_DATA_PATH}'...")
-    df = pd.read_parquet(Config.ENGINEERED_DATA_PATH)
+    print(f"\nLoading engineered data...")
+    df = load_engineered_data()
     features = Config.get_feature_list()
 
     print(f"Total rows: {len(df):,}")

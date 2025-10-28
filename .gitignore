@@ -1,10 +1,12 @@
 data
-models
-results
+outputs/models_trained
+outputs/results
+outputs
 venv
 .idea
 *.csv
 .DS_Store
 __pycache__
-logs
+outputs/logs
 .ipynb_checkpoints
+outputs/stage1_feasibility

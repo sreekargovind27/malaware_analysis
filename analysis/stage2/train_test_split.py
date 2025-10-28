@@ -9,7 +9,7 @@ import os
 from sklearn.model_selection import train_test_split
 
 from config import Config
-from data_loader import load_engineered_data
+from models.data_loader import load_engineered_data
 
 
 def create_and_save_master_splits():
@@ -18,7 +18,7 @@ def create_and_save_master_splits():
     print("=" * 70)
 
     # Define the output directory and create it if it doesn't exist.
-    output_dir = 'data/master_splits'
+    output_dir = Config.SPLITS_DIR
     os.makedirs(output_dir, exist_ok=True)
     print(f"   Output directory: {output_dir}")
 
@@ -37,8 +37,8 @@ def create_and_save_master_splits():
     print("✓ Split complete.")
 
     # Save the resulting train and test sets as Parquet files.
-    train_path = os.path.join(output_dir, 'train_set.parquet')
-    test_path = os.path.join(output_dir, 'test_set.parquet')
+    train_path = Config.TRAIN_SET_PATH
+    test_path = Config.TEST_SET_PATH
 
     print(f"\n💾 Saving training set ({len(train_df):,} rows) to {train_path}...")
     train_df.to_parquet(train_path, index=False)

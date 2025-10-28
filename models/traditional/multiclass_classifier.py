@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import Config
-from data_loader import get_data_for_multiclass, IoTDataset
+from models.data_loader import get_data_for_multiclass, IoTDataset
 
 
 # ============================================================

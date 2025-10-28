@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
 from config import Config
-from data_loader import get_data_for_virus
+from models.data_loader import get_data_for_virus
 
 
 class VirusClassifier:
