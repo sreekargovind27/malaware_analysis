@@ -5,10 +5,9 @@ distribution of the target labels.
 """
 import os
 
-import pandas as pd
-
+from analysis.stage2.utils import load_engineered_data
 from config import Config
-from models.data_loader import load_engineered_data
+
 
 def check_engineered_data_quality():
     """Checks the data quality of the final engineered Parquet file."""

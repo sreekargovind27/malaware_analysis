@@ -9,7 +9,7 @@ import os
 from sklearn.model_selection import train_test_split
 
 from config import Config
-from models.data_loader import load_engineered_data
+from analysis.stage2.utils import load_engineered_data
 
 
 def create_and_save_master_splits():

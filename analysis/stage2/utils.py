@@ -1,9 +1,23 @@
 """
 Shared utility functions for Stage 2 data preparation.
 """
-import pandas as pd
+import os
+
 import numpy as np
+import pandas as pd
+
 from config import Config
+
+
+def load_engineered_data():
+    """Loads the main engineered dataset from the path specified in Config."""
+    path = Config.ENGINEERED_DATA_PATH
+    print(f"\n📂 Loading FULL engineered data from: {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Engineered data not found at '{path}'. Please run 'feature_engineering.py' first.")
+    df = pd.read_parquet(path)
+    print(f"✓ Loaded {len(df):,} total samples.")
+    return df
 
 
 def load_flow_features():
@@ -102,4 +116,4 @@ def extract_subnet(ip_series):
 
 def extract_port_protocol(df):
     """Create service identifier from port and protocol."""
-    return df['id.resp_p'].astype(str) + ':' + df['proto'].astype(str)
+    return df['id_resp_p'].astype(str) + ':' + df['proto'].astype(str)

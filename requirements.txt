@@ -31,3 +31,5 @@ optuna>=3.3.0
 # Optional: GPU acceleration (uncomment if using GPU) - for linux
 # cudf-cu11>=23.0.0
 # cuml-cu11>=23.0.0
+
+torch-geometric

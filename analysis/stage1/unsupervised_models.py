@@ -5,7 +5,7 @@ FIXED VERSION - Unsupervised Models Feasibility Analysis (Autoencoder, K-Means, 
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, LongType, FloatType, DoubleType
 
-from .utils import parse_binary_label, parse_attack_type, get_malware_family_udf
+from .utils import parse_binary_label, parse_attack_type, get_malware_family_udf, get_combined_label_column
 
 
 def get_numeric_columns(df):
@@ -26,8 +26,8 @@ def get_numeric_columns(df):
         if isinstance(field.dataType, (IntegerType, LongType, FloatType, DoubleType))
     ]
 
-    # Remove non-feature columns
-    exclude_cols = ['ts', 'id.orig_p', 'id.resp_p']
+    # ✅ FINAL FIX: Use the new, clean underscored names
+    exclude_cols = ['ts', 'id_orig_p', 'id_resp_p']
     feature_cols = [col for col in numeric_cols if col not in exclude_cols]
 
     return feature_cols
@@ -49,7 +49,8 @@ def analyze_autoencoder_feasibility(df):
 
     # Parse labels
     print("  Filtering benign samples...")
-    df_labeled = df.withColumn('parsed_label', parse_binary_label('label'))
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
 
     benign_df = df_labeled.filter(F.col('parsed_label') == 'Benign')
     benign_count = benign_df.count()
@@ -130,7 +131,8 @@ def analyze_clustering_feasibility(df):
 
     # Parse labels
     print("  Filtering malicious samples...")
-    df_labeled = df.withColumn('parsed_label', parse_binary_label('label'))
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
     df_labeled = df_labeled.withColumn('malware_family', get_malware_family_udf()(F.col('Source_Folder')))
 
     malicious_df = df_labeled.filter(F.col('parsed_label') == 'Malicious')
@@ -240,7 +242,8 @@ def analyze_gan_feasibility_for_all_tasks(df):
 
     # --- 1. Binary Classification Analysis ---
     print("  Analyzing for: Binary Classification...")
-    df_binary = df.withColumn('parsed_label', parse_binary_label('label'))
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_binary = df.withColumn('parsed_label', parse_binary_label(combined_col))
     binary_counts = df_binary.groupBy('parsed_label').count().collect()
     binary_dict = {row['parsed_label']: int(row['count']) for row in binary_counts if row['parsed_label']}
 
@@ -256,8 +259,11 @@ def analyze_gan_feasibility_for_all_tasks(df):
 
     # --- 2. Multi-Class Attack Type Analysis ---
     print("  Analyzing for: Multi-Class Attack Type...")
-    df_multiclass = df.withColumn('attack_type', parse_attack_type('label'))
-    malicious_df = df_multiclass.filter(parse_binary_label('label') == 'Malicious')
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_multiclass = df.withColumn('parsed_label', parse_binary_label(combined_col))  # This line added
+    df_multiclass = df_multiclass.withColumn('attack_type', parse_attack_type(combined_col))
+
+    malicious_df = df_multiclass.filter(F.col('parsed_label') == 'Malicious')
 
     attack_counts = malicious_df.groupBy('attack_type').count().collect()
     attack_dict = {row['attack_type']: int(row['count']) for row in attack_counts if
@@ -294,7 +300,9 @@ def analyze_gan_feasibility_for_all_tasks(df):
     # --- 3. Malware Family Classification Analysis ---
     print("  Analyzing for: Malware Family Classification...")
     df_family = df.withColumn('malware_family', get_malware_family_udf()(F.col('Source_Folder')))
-    malicious_family_df = df_family.filter(parse_binary_label('label') == 'Malicious')
+    combined_col_fam = get_combined_label_column('label', 'detailed-label')
+    malicious_family_df = df_family.withColumn('parsed_label', parse_binary_label(combined_col_fam)).filter(
+        F.col('parsed_label') == 'Malicious')
 
     family_counts = malicious_family_df.filter(
         F.col('malware_family').isNotNull() & ~F.col('malware_family').isin(['Benign', 'Unknown'])
@@ -323,8 +331,8 @@ def analyze_gan_feasibility_for_all_tasks(df):
             'very_rare_classes (10-99 samples)': very_rare_fam,
             'rare_classes (100-999 samples)': rare_fam,
             'sufficient_classes (>=1000 samples)': sufficient_fam,
-            'numeric_feature_count': len(feature_cols_fam),    # ✅ ADD
-            'numeric_features': feature_cols_fam[:20]           # ✅ ADD
+            'numeric_feature_count': len(feature_cols_fam),  # ✅ ADD
+            'numeric_features': feature_cols_fam[:20]  # ✅ ADD
         }
     print(f"    ✓ Feasibility: {'RECOMMENDED' if needs_gan_fam else 'GO'}")
 

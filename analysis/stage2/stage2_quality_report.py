@@ -4,9 +4,11 @@ Stage 2 Comprehensive Quality Report
 Validates Stage 2 outputs before proceeding to Stage 3 training.
 Saves validation report to outputs/stage2_quality/
 """
-import os
 import json
+import os
+
 import pandas as pd
+
 from config import Config
 
 
@@ -49,13 +51,13 @@ def validate_stage2_outputs():
             report['warnings'].append(
                 f"Flow features: {report['files_checked']['flow_features']['missing_values']} missing values found")
 
-        print(f"   ✓ Rows: {len(df):,}")
-        print(f"   ✓ Features: {len(features)}")
+        print(f"   âœ“ Rows: {len(df):,}")
+        print(f"   âœ“ Features: {len(features)}")
     else:
         report['files_checked']['flow_features'] = {'exists': False}
         report['issues'].append("Flow features file not found")
         report['overall_status'] = 'FAIL'
-        print("   ❌ File not found")
+        print("   âŒ File not found")
 
     # 2. Check device features
     print("\n[2/6] Validating device features...")
@@ -72,13 +74,13 @@ def validate_stage2_outputs():
         if len(device_df) < 100:
             report['warnings'].append("Device features: Very few devices (<100)")
 
-        print(f"   ✓ Devices: {len(device_df):,}")
-        print(f"   ✓ Benign: {report['files_checked']['device_features']['benign_devices']:,}")
-        print(f"   ✓ Malicious: {report['files_checked']['device_features']['malicious_devices']:,}")
+        print(f"   âœ“ Devices: {len(device_df):,}")
+        print(f"   âœ“ Benign: {report['files_checked']['device_features']['benign_devices']:,}")
+        print(f"   âœ“ Malicious: {report['files_checked']['device_features']['malicious_devices']:,}")
     else:
         report['files_checked']['device_features'] = {'exists': False}
         report['warnings'].append("Device features not found (GNN unavailable)")
-        print("   ⚠️  File not found (GNN will be unavailable)")
+        print("   âš ï¸  File not found (GNN will be unavailable)")
 
     # 3. Check train/test splits
     print("\n[3/6] Validating train/test splits...")
@@ -102,9 +104,9 @@ def validate_stage2_outputs():
             'split_ratio'] > 0.25:
             report['warnings'].append(f"Unusual split ratio: {report['files_checked']['splits']['split_ratio']}")
 
-        print(f"   ✓ Train: {len(train_df):,} rows")
-        print(f"   ✓ Test: {len(test_df):,} rows")
-        print(f"   ✓ Split ratio: {report['files_checked']['splits']['split_ratio']}")
+        print(f"   âœ“ Train: {len(train_df):,} rows")
+        print(f"   âœ“ Test: {len(test_df):,} rows")
+        print(f"   âœ“ Split ratio: {report['files_checked']['splits']['split_ratio']}")
     else:
         report['files_checked']['splits'] = {
             'train_exists': train_exists,
@@ -112,7 +114,7 @@ def validate_stage2_outputs():
         }
         report['issues'].append("Train/test splits missing")
         report['overall_status'] = 'FAIL'
-        print("   ❌ Split files not found")
+        print("   âŒ Split files not found")
 
     # 4. Check graph
     print("\n[4/6] Validating heterogeneous graph...")
@@ -125,15 +127,15 @@ def validate_stage2_outputs():
                 'exists': True,
                 'stats': graph_stats
             }
-            print(f"   ✓ Device nodes: {graph_stats['num_device_nodes']:,}")
-            print(f"   ✓ Total edges: {graph_stats['total_edges']:,}")
+            print(f"   âœ“ Device nodes: {graph_stats['num_device_nodes']:,}")
+            print(f"   âœ“ Total edges: {graph_stats['total_edges']:,}")
         else:
             report['files_checked']['graph'] = {'exists': True, 'stats': None}
-            print("   ✓ Graph exists (no stats file)")
+            print("   âœ“ Graph exists (no stats file)")
     else:
         report['files_checked']['graph'] = {'exists': False}
         report['warnings'].append("Heterogeneous graph not found (GNN unavailable)")
-        print("   ⚠️  Graph not found (GNN will be unavailable)")
+        print("   âš ï¸  Graph not found (GNN will be unavailable)")
 
     # 5. Check feature list
     print("\n[5/6] Validating feature list...")
@@ -143,21 +145,23 @@ def validate_stage2_outputs():
             'exists': True,
             'count': len(features)
         }
-        print(f"   ✓ Feature list: {len(features)} features")
+        print(f"   âœ“ Feature list: {len(features)} features")
     else:
         report['files_checked']['feature_list'] = {'exists': False}
         report['issues'].append("Feature list file not found")
         report['overall_status'] = 'FAIL'
-        print("   ❌ Feature list not found")
+        print("   âŒ Feature list not found")
 
     # 6. Check label distributions
     print("\n[6/6] Validating label distributions...")
-    if train_exists:
+    if train_exists and test_exists:
         train_df = pd.read_parquet(Config.TRAIN_SET_PATH)
+        test_df = pd.read_parquet(Config.TEST_SET_PATH)
+        full_df = pd.concat([train_df, test_df], ignore_index=True)
 
-        binary_dist = train_df[Config.TARGET_COL].value_counts().to_dict()
-        multiclass_dist = train_df[Config.DETAILED_TARGET_COL].value_counts().to_dict()
-        family_dist = train_df[Config.FAMILY_TARGET_COL].value_counts().to_dict()
+        binary_dist = full_df[Config.TARGET_COL].value_counts().to_dict()
+        multiclass_dist = full_df[Config.DETAILED_TARGET_COL].value_counts().to_dict()
+        family_dist = full_df[Config.FAMILY_TARGET_COL].value_counts().to_dict()
 
         report['files_checked']['label_distributions'] = {
             'binary': binary_dist,
@@ -171,9 +175,10 @@ def validate_stage2_outputs():
             if ratio > 100:
                 report['warnings'].append(f"Severe class imbalance: {ratio:.1f}:1 ratio")
 
-        print(f"   ✓ Binary classes: {len(binary_dist)}")
-        print(f"   ✓ Attack types: {len(multiclass_dist)}")
-        print(f"   ✓ Malware families: {len(family_dist)}")
+        print(f"   âœ“ Binary classes: {len(binary_dist)}")
+        print(f"   ✓ Total samples in report: {len(full_df):,}")
+        print(f"   âœ“ Attack types: {len(multiclass_dist)}")
+        print(f"   âœ“ Malware families: {len(family_dist)}")
 
     # Save report
     report_dir = Config.STAGE2_QUALITY_DIR
@@ -190,19 +195,19 @@ def validate_stage2_outputs():
     print(f"Overall Status: {report['overall_status']}")
 
     if report['issues']:
-        print(f"\n❌ Issues ({len(report['issues'])}):")
+        print(f"\nâŒ Issues ({len(report['issues'])}):")
         for issue in report['issues']:
             print(f"   - {issue}")
 
     if report['warnings']:
-        print(f"\n⚠️  Warnings ({len(report['warnings'])}):")
+        print(f"\nâš ï¸  Warnings ({len(report['warnings'])}):")
         for warning in report['warnings']:
             print(f"   - {warning}")
 
     if report['overall_status'] == 'PASS' and not report['issues']:
-        print("\n✅ All checks passed! Data ready for Stage 3 training.")
+        print("\nâœ… All checks passed! Data ready for Stage 3 training.")
 
-    print(f"\n📄 Report saved to: {report_path}")
+    print(f"\nðŸ“„ Report saved to: {report_path}")
     print("=" * 70)
 
     return report

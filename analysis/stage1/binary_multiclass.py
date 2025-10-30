@@ -6,6 +6,7 @@ from pyspark.sql import functions as F
 
 # Get numeric features
 from .unsupervised_models import get_numeric_columns
+from .utils import get_combined_label_column
 from .utils import parse_binary_label, parse_attack_type
 
 
@@ -25,7 +26,8 @@ def analyze_binary_classification(df):
 
     # Parse labels from detailed-label column (NOT filename)
     print("  Parsing labels from 'detailed-label' column...")
-    df_labeled = df.withColumn('parsed_label', parse_binary_label('label'))
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
 
     # Get class counts
     class_counts = df_labeled.groupBy('parsed_label').count().collect()
@@ -103,8 +105,9 @@ def analyze_multiclass_classification(df):
 
     # Parse labels
     print("  Parsing attack types from 'detailed-label' column...")
-    df_labeled = df.withColumn('parsed_label', parse_binary_label('label'))
-    df_labeled = df_labeled.withColumn('attack_type', parse_attack_type('label'))
+    combined_col = get_combined_label_column('label', 'detailed-label')
+    df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
+    df_labeled = df_labeled.withColumn('attack_type', parse_attack_type(combined_col))
 
     # Filter only malicious (multi-class only on malicious traffic)
     malicious_df = df_labeled.filter(F.col('parsed_label') == 'Malicious')
@@ -134,7 +137,7 @@ def analyze_multiclass_classification(df):
         attack_count = attack_df.count()
 
         if attack_count > 0:
-            null_count = sum([attack_df.filter(F.col(f'`{col}`').isNull()).count() for col in df.columns])
+            null_count = sum([attack_df.filter(F.col(col).isNull()).count() for col in df.columns])
             total_cells = attack_count * len(df.columns)
             missing_pct = round((null_count / total_cells) * 100, 2) if total_cells > 0 else 0
             missing_per_class[attack_type] = missing_pct

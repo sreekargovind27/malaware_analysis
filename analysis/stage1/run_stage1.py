@@ -103,12 +103,13 @@ def main():
     print("\nInitializing Spark session...")
     spark = Config.get_spark_session("Stage1-Feasibility-Analysis")
     print(f"✓ Spark version: {spark.version}")
-    
-    # Load raw data
+
+    # ✅ FINAL FIX: RUN PREPROCESSING FIRST
     try:
         df = load_raw_data(spark)
     except Exception as e:
         print(f"\n❌ Error loading data: {e}")
+        spark.stop()
         return
     
     # Dictionary to store all results

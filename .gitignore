@@ -10,3 +10,4 @@ __pycache__
 outputs/logs
 .ipynb_checkpoints
 outputs/stage1_feasibility
+all_python_files

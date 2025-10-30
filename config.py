@@ -17,13 +17,19 @@ class Config:
 
     # Data directories (keep separate - raw data is large)
     DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+
+    # âœ… THE NEW, CLEAN DATA SOURCE FOR THE ENTIRE PIPELINE
+    # Raw data directories
+    # RAW_DIR_MESSY: Original downloaded data with potential inconsistencies
+    # RAW_DIR_ORIGINAL: Standardized, clean data ready for processing
+    RAW_DIR_MESSY = os.path.join(DATA_DIR, 'raw_messy_test' if TEST_MODE else 'raw_messy')
     RAW_DIR_ORIGINAL = os.path.join(DATA_DIR, 'raw_test' if TEST_MODE else 'raw')
 
     # ===== OUTPUTS DIRECTORY (NEW) =====
     OUTPUTS_DIR = os.path.join(PROJECT_ROOT, 'outputs')
 
     # Stage 1 - Feasibility Analysis
-    STAGE1_FEASIBILITY_DIR = os.path.join(OUTPUTS_DIR, 'outputs/stage1_feasibility')
+    STAGE1_FEASIBILITY_DIR = os.path.join(OUTPUTS_DIR, 'stage1_feasibility')
 
     # Stage 2 - Prepared Data
     STAGE2_PREPARED_DIR = os.path.join(OUTPUTS_DIR, 'stage2_prepared')
@@ -41,14 +47,14 @@ class Config:
     GRAPH_DIR = os.path.join(STAGE2_PREPARED_DIR, 'graph')
 
     # Trained Models
-    MODELS_DIR = os.path.join(OUTPUTS_DIR, 'outputs/models_trained')
+    MODELS_DIR = os.path.join(OUTPUTS_DIR, 'models_trained')
     TRADITIONAL_MODELS_DIR = os.path.join(MODELS_DIR, 'traditional')
     DL_MODELS_DIR = os.path.join(MODELS_DIR, 'deep_learning')
     GNN_MODELS_DIR = os.path.join(MODELS_DIR, 'gnn')
     UNSUPERVISED_MODELS_DIR = os.path.join(MODELS_DIR, 'unsupervised')
 
     # Results
-    RESULTS_DIR = os.path.join(OUTPUTS_DIR, 'outputs/results')
+    RESULTS_DIR = os.path.join(OUTPUTS_DIR, 'results')
     BINARY_RESULTS_DIR = os.path.join(RESULTS_DIR, 'binary_classification')
     MULTICLASS_RESULTS_DIR = os.path.join(RESULTS_DIR, 'multiclass')
     FAMILY_RESULTS_DIR = os.path.join(RESULTS_DIR, 'malware_family')
@@ -56,7 +62,7 @@ class Config:
     CLUSTERING_RESULTS_DIR = os.path.join(RESULTS_DIR, 'clustering')
 
     # Logs
-    LOGS_DIR = os.path.join(OUTPUTS_DIR, 'outputs/logs')
+    LOGS_DIR = os.path.join(OUTPUTS_DIR, 'logs')
 
     # Feature files
     ENGINEERED_DATA_PATH = os.path.join(STAGE2_PREPARED_DIR, 'flow_features.parquet')
@@ -80,6 +86,7 @@ class Config:
     SUBNET_NODES_PATH = os.path.join(GRAPH_DIR, 'subnet_nodes.parquet')
     EDGES_PATH = os.path.join(GRAPH_DIR, 'edges.parquet')
     GRAPH_STATS_PATH = os.path.join(GRAPH_DIR, 'graph_stats.json')
+    GAN_RESULTS_DIR = os.path.join(RESULTS_DIR, 'gan')
 
     # Malware family mapping (filename -> family name)
     FILENAME_TO_FAMILY_MAP = {
@@ -137,7 +144,7 @@ class Config:
 
     # Feature definitions used during data engineering.
     BASE_NUMERICAL_FEATURES = ['duration', 'orig_bytes', 'resp_bytes', 'orig_pkts', 'resp_pkts', 'orig_ip_bytes',
-                               'resp_ip_bytes', 'missed_bytes', 'id.resp_p']
+                               'resp_ip_bytes', 'missed_bytes', 'id_resp_p']
     SKEWED_NUMERICAL_FEATURES = ['duration', 'orig_bytes', 'resp_bytes', 'orig_pkts', 'resp_pkts', 'orig_ip_bytes',
                                  'resp_ip_bytes']
     CATEGORICAL_LABEL_ENCODE = ['service', 'history']
@@ -177,11 +184,22 @@ class Config:
     else:
         DEVICE = 'cpu'
 
+    NOISE_START = 0.05  # Starting noise factor
+    NOISE_WARMUP_EPOCHS = 40  # Epochs to ramp from start to final noise
+
+    # WGAN-GP semi-supervised settings
+    GAN_USE_MALICIOUS = True
+    GAN_MALICIOUS_RATIO = 0.1
+    GAN_MALICIOUS_WEIGHT = 0.2
+    GAN_TEST_INJECTION_RATES = True  # Set True to run grid search
+
     AUTOENCODER_LATENT_DIM = 8
     AUTOENCODER_EPOCHS = 100
-    AUTOENCODER_BATCH_SIZE = 32768
-    AUTOENCODER_LR = 0.0001
-    ANOMALY_THRESHOLD_PERCENTILE = 85
+    AUTOENCODER_BATCH_SIZE = 4096  # instead of 32768
+    AUTOENCODER_LR = 1e-3  # calm LR, Optuna will tune within [1e-4, 5e-3]
+    USE_LATENT_SPARSITY = True
+    SPARSITY_WARMUP_EPOCHS = 30
+    LATENT_SPARSITY_LAMBDA = 1e-3
     BINARY_N_ESTIMATORS = 200
     BINARY_LEARNING_RATE = 0.1
     BINARY_NUM_LEAVES = 50
@@ -191,7 +209,7 @@ class Config:
     MULTICLASS_MAX_DEPTH = 10
     KMEANS_N_CLUSTERS = 5
     KMEANS_BATCH_SIZE = 10000
-    NUM_WORKERS = 6
+    NUM_WORKERS = 2
     PIN_MEMORY = True
     N_JOBS = 32
 
@@ -199,6 +217,7 @@ class Config:
     def ensure_output_dirs():
         """Create output directories if they don't exist. Call this at the start of each script."""
         for dir_path in [
+            Config.RAW_DIR_MESSY,
             Config.RAW_DIR_ORIGINAL,
             Config.STAGE1_FEASIBILITY_DIR,
             Config.STAGE2_PREPARED_DIR,
@@ -255,9 +274,9 @@ class Config:
     def print_mode_info():
         """Prints the current configuration mode to the console."""
         print("\n" + "=" * 70)
-        print("âš™ï¸  CONFIGURATION MODE")
+        print("Ã¢Å¡â„¢Ã¯Â¸Â  CONFIGURATION MODE")
         print("=" * 70)
-        mode = "TEST MODE ðŸ§ª" if Config.TEST_MODE else "PRODUCTION MODE ðŸš€"
+        mode = "TEST MODE Ã°Å¸Â§Âª" if Config.TEST_MODE else "PRODUCTION MODE Ã°Å¸Å¡â‚¬"
         print(f"   Mode: {mode}")
         print(f"   Raw Data Directory: {Config.RAW_DIR_ORIGINAL}")
         print(f"   Device: {Config.DEVICE}")

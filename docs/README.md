@@ -31,6 +31,9 @@ Stage 3: Model Training & Evaluation (Scikit-learn, PyTorch, PyG)
 ## 🚀 Quick Start
 
 ### Prerequisites
+```
+pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
+```
 
 **Local Execution:**
 - Python 3.8+
