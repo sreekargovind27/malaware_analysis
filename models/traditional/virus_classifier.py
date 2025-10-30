@@ -213,7 +213,7 @@ class VirusClassifier:
         plt.ylabel('True Family')
         plt.xlabel('Predicted Family')
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_confusion_matrix.png'), dpi=300)
+        plt.savefig(os.path.join(Config.FAMILY_RESULTS_DIR, 'virus_confusion_matrix.png'), dpi=300)
         plt.close()
         print("  ✓ Saved confusion matrix")
 
@@ -226,7 +226,7 @@ class VirusClassifier:
         plt.ylabel('Features')
         plt.title('Top 20 Feature Importance - Virus Classification')
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'virus_feature_importance.png'), dpi=300)
+        plt.savefig(os.path.join(Config.FAMILY_RESULTS_DIR, 'virus_feature_importance.png'), dpi=300)
         plt.close()
         print("  ✓ Saved feature importance plot")
 
@@ -252,14 +252,36 @@ class VirusClassifier:
                 print(f"   Avg Confidence (when correct): {avg_confidence:.4f}")
         print(f"\n⏱️  Analysis time: {time.time() - t_start:.2f}s")
 
+    @classmethod
+    def load_model(cls, filename='virus_classifier.pkl'):
+        """Load a saved virus classifier model."""
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Model file not found: {filepath}")
+
+        data = joblib.load(filepath)
+
+        # Create instance and load model
+        instance = cls(params=data.get('params'))
+        instance.model = data['model']
+        instance.best_params = data.get('params')
+        instance.num_classes = instance.model.n_classes_ if hasattr(instance.model, 'n_classes_') else None
+
+        print(f"✓ Model loaded from: {filename}")
+        if instance.num_classes:
+            print(f"  Classes: {instance.num_classes}")
+
+        return instance
+
     def save_model(self, filename='virus_classifier.pkl'):
-        filepath = os.path.join(Config.MODELS_DIR, filename)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
         joblib.dump({'model': self.model, 'params': self.best_params if self.best_params else self.params}, filepath)
         print(f"\n💾 Model saved: {filename}")
 
 
 if __name__ == "__main__":
     Config.set_seeds()
+    Config.ensure_output_dirs()  # ✅ ADD THIS LINE
     Config.print_mode_info()
 
     print("=" * 70)

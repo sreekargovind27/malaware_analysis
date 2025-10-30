@@ -190,7 +190,7 @@ class BinaryClassifier:
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'binary_tuned_confusion_matrix.png'), dpi=300)
+        plt.savefig(os.path.join(Config.BINARY_RESULTS_DIR, 'binary_tuned_confusion_matrix.png'), dpi=300)
         plt.close()
 
     def _plot_roc_curve(self, y_test, y_proba, roc_auc):
@@ -204,19 +204,19 @@ class BinaryClassifier:
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'binary_tuned_roc_curve.png'), dpi=300)
+        plt.savefig(os.path.join(Config.BINARY_RESULTS_DIR, 'binary_tuned_roc_curve.png'), dpi=300)
         plt.close()
 
     def _plot_feature_importance(self, feature_names):
         lgb.plot_importance(self.model, max_num_features=20, height=0.8, figsize=(12, 8))
         plt.title('Top 20 Feature Importance - Tuned LightGBM', fontsize=14)
         plt.tight_layout()
-        plt.savefig(os.path.join(Config.RESULTS_DIR, 'binary_tuned_feature_importance.png'), dpi=300)
+        plt.savefig(os.path.join(Config.BINARY_RESULTS_DIR, 'binary_tuned_feature_importance.png'), dpi=300)
         plt.close()
         print("✓ All plots saved.")
 
     def save_model(self, filename='binary_classifier_tuned.pkl'):
-        filepath = os.path.join(Config.MODELS_DIR, filename)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
         joblib.dump({'model': self.model, 'params': self.best_params if self.best_params else self.params}, filepath)
         print(f"\n💾 Model saved: {filename}")
 
@@ -250,6 +250,7 @@ def train_and_evaluate_baseline(X_train, y_train, X_test, y_test):
 
 if __name__ == "__main__":
     Config.set_seeds()
+    Config.ensure_output_dirs()  # ✅ ADD THIS LINE
     Config.print_mode_info()
 
     print("=" * 70)

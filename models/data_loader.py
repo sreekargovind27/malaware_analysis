@@ -74,30 +74,74 @@ def load_master_test_set():
 
 
 def get_data_for_autoencoder():
-    """Loads and prepares data for the Autoencoder, using only benign samples from the full dataset."""
+    """Loads and prepares data for the Autoencoder, using only CLEAN benign samples from the full dataset."""
     print("\n" + "=" * 70)
     print("🔧 PREPARING DATA FOR AUTOENCODER (from full dataset)")
     print("=" * 70)
+
+    # 1. Load full engineered dataset
     df = load_engineered_data()
     features = Config.get_feature_list()
+
+    # 2. Keep only benign rows
     print(f"\n⏳ Filtering benign data...")
     benign_df = df.loc[df[Config.TARGET_COL] == 'Benign', features]
     print(f"✓ Filtered to {len(benign_df):,} benign samples")
+
+    # 3. Drop constant columns
     print(f"\n⏳ Removing constant columns...")
     non_constant_cols = benign_df.columns[benign_df.std() > 1e-6].tolist()
     joblib.dump(non_constant_cols, Config.AUTOENCODER_FEATURE_LIST_PATH)
+
     X = benign_df[non_constant_cols].fillna(0)
+
+    # 4. Scale features
     print(f"\n⏳ Scaling features...")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X.values)
+    X_scaled = scaler.fit_transform(X.values.astype(np.float32))
     X_scaled = np.nan_to_num(X_scaled)
+
+    # 5. Remove 'weird' benign outliers before training (IsolationForest)
+    #    Goal: train AE on only the stable/typical benign distribution so it learns a tight manifold.
+    print(f"\n⏳ Filtering out borderline/dirty benign samples with IsolationForest...")
+    from sklearn.ensemble import IsolationForest
+    iso = IsolationForest(
+        n_estimators=100,
+        contamination=0.05,   # assume ~5% of your 'benign' is actually noisy/weird
+        random_state=42
+    )
+    inlier_mask = iso.fit_predict(X_scaled)  # 1 = inlier, -1 = outlier
+    inlier_mask = (inlier_mask == 1)
+
+    X_core = X_scaled[inlier_mask]
+    print(f"✓ Core benign kept: {X_core.shape[0]:,} / {X_scaled.shape[0]:,}")
+
+    # 6. Train/val split on CLEAN benign only
     print(f"\n⏳ Creating train/validation split...")
-    X_train, X_val = train_test_split(X_scaled, test_size=0.2, random_state=Config.RANDOM_STATE)
+    X_train, X_val = train_test_split(
+        X_core,
+        test_size=0.2,
+        random_state=Config.RANDOM_STATE
+    )
+
+    # 7. Torch DataLoaders
     print(f"\n⏳ Creating PyTorch DataLoaders...")
-    train_loader = DataLoader(IoTDataset(X_train), batch_size=Config.AUTOENCODER_BATCH_SIZE, shuffle=True,
-                              num_workers=Config.NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(IoTDataset(X_val), batch_size=Config.AUTOENCODER_BATCH_SIZE, shuffle=False,
-                            num_workers=Config.NUM_WORKERS, pin_memory=True)
+    train_loader = DataLoader(
+        IoTDataset(X_train),
+        batch_size=Config.AUTOENCODER_BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        IoTDataset(X_val),
+        batch_size=Config.AUTOENCODER_BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True
+    )
+
     print(f"✓ Autoencoder data ready.")
     return train_loader, val_loader, scaler, non_constant_cols
 

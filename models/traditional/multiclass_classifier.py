@@ -201,8 +201,8 @@ class MultiClassXGBoost:
         plt.xticks(rotation=45, ha="right")
         plt.yticks(rotation=0)
         plt.tight_layout()
-        os.makedirs(Config.RESULTS_DIR, exist_ok=True)
-        outpath = os.path.join(Config.RESULTS_DIR, "multiclass_xgb_confusion_matrix.png")
+        os.makedirs(Config.MULTICLASS_RESULTS_DIR, exist_ok=True)
+        outpath = os.path.join(Config.MULTICLASS_RESULTS_DIR, "multiclass_xgb_confusion_matrix.png")
         plt.savefig(outpath)
         plt.close()
         print(f"  ✓ Saved confusion matrix -> {outpath}")
@@ -210,8 +210,8 @@ class MultiClassXGBoost:
     def save_model(self, filename="multiclass_xgboost.pkl"):
         if self.model is None:
             raise RuntimeError("XGBoost model not trained; cannot save.")
-        filepath = os.path.join(Config.MODELS_DIR, filename)
-        os.makedirs(Config.MODELS_DIR, exist_ok=True)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
+        os.makedirs(Config.TRADITIONAL_MODELS_DIR, exist_ok=True)
         joblib.dump(
             {"model": self.model, "num_classes": self.num_classes, "best_params": self.best_params},
             filepath
@@ -219,7 +219,7 @@ class MultiClassXGBoost:
         print(f"💾 Saved XGBoost model to {filepath}")
 
     def load_model(self, filename="multiclass_xgboost.pkl"):
-        filepath = os.path.join(Config.MODELS_DIR, filename)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"❌ Model file {filepath} not found")
         payload = joblib.load(filepath)
@@ -286,7 +286,7 @@ class MultiClassNeuralNetModel:
 
     def load_model(self, filename='multiclass_nn.pth'):
         """Load model, correctly rebuilding the architecture from the file first."""
-        filepath = os.path.join(Config.MODELS_DIR, filename)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"❌ Model file {filepath} not found")
 
@@ -306,7 +306,7 @@ class MultiClassNeuralNetModel:
 
     def save_model(self, filename='multiclass_nn.pth'):
         """Save model AND its architecture."""
-        filepath = os.path.join(Config.MODELS_DIR, filename)
+        filepath = os.path.join(Config.TRADITIONAL_MODELS_DIR, filename)
         os.makedirs(Config.MODELS_DIR, exist_ok=True)
         if self.model is None:
             raise RuntimeError("Model has not been built yet. Cannot save.")
@@ -494,8 +494,8 @@ class MultiClassNeuralNetModel:
         plt.xticks(rotation=45, ha='right')
         plt.yticks(rotation=0)
         plt.tight_layout()
-        os.makedirs(Config.RESULTS_DIR, exist_ok=True)
-        outpath = os.path.join(Config.RESULTS_DIR, 'multiclass_nn_confusion_matrix.png')
+        os.makedirs(Config.MULTICLASS_RESULTS_DIR, exist_ok=True)
+        outpath = os.path.join(Config.MULTICLASS_RESULTS_DIR, 'multiclass_nn_confusion_matrix.png')
         plt.savefig(outpath)
         plt.close()
         print("  ✓ Saved confusion matrix")
@@ -506,6 +506,7 @@ class MultiClassNeuralNetModel:
 # ============================================================
 if __name__ == "__main__":
     Config.print_mode_info()
+    Config.ensure_output_dirs()  # ✅ ADD THIS LINE
     Config.set_seeds()
 
     print("=" * 70)
