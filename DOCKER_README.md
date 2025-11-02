@@ -1,108 +1,174 @@
-# Docker Setup for IoT-23 Analysis
-
-Run Stage 1 analysis in Docker with pre-configured Java 11 and PySpark.
-
-## Prerequisites
-
-- Docker installed
-- Docker Compose installed (optional but recommended)
+# IoT-23 Pipeline - Docker Setup
 
 ## Quick Start
 
-### Option 1: Using Docker Compose (Recommended)
+### 1. Run Full Pipeline (Stage 1 + Stage 2)
+This runs Stage 1 first, then Stage 2 in the same container.
+```bash
+docker compose run full_pipeline
+````
+
+### 2. Run Only Stage 2 (manually, whenever you want)
+
+This skips Stage 1 and just runs Stage 2.
 
 ```bash
-# Build and run
-docker-compose up --build
-
-# Run in background
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop
-docker-compose down
+docker compose run stage2_only
 ```
 
-### Option 2: Using Docker directly
+### 3. Rebuild / clean run
+
+If you changed code or config:
 
 ```bash
-# Build image
-docker build -t iot23-analysis .
-
-# Run Stage 1 analysis
-docker run -v $(pwd)/data:/app/data \
-           -v $(pwd)/stage1_feasibility:/app/stage1_feasibility \
-           iot23-analysis
+docker compose down
+docker compose build --no-cache
+docker compose up    # (optional: attaches logs if you want to watch)
 ```
 
-## What Gets Mounted
+## File Structure
 
-The Docker setup mounts these directories as volumes:
+```text
+project/
+├── data/                    # Mount your raw CSV files here
+│   └── raw/
+│       └── original/        # Put IoT-23 CSVs here
+├── outputs/                 # All outputs get written here
+│   ├── stage1_feasibility/
+│   └── stage2_prepared/
+│       ├── engineered_data.parquet
+│       ├── splits/
+│       └── train/test/val parquet files
+├── analysis/
+│   ├── stage1/
+│   │   └── run_stage1.py
+│   └── stage2/
+│       ├── feature_engineering.py
+│       ├── device_aggregation.py
+│       ├── train_test_split.py
+│       └── run_stage2.py
+├── config.py
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
 
-- `./outputs` → `/app/outputs` (all pipeline outputs)
-  - `stage1_feasibility/` - Stage 1 JSON reports
-  - `stage2_prepared/` - Engineered features & splits
-  - `stage2_quality/` - Validation reports
-  - `models_trained/` - Trained models
-  - `results/` - Evaluation results
-  - `logs/` - Pipeline logs
+## What Actually Runs
 
-## Output
+### `docker compose run full_pipeline`
 
-After running, check `/app/stage1_feasibility` for:
-- `summary.json`
-- `data_quality.json`
-- `binary_feasibility.json`
-- `multiclass_feasibility.json`
-- `malware_family_feasibility.json`
-- `graph_feasibility.json`
-- `autoencoder_feasibility.json`
-- `clustering_feasibility.json`
-- `gan_candidates.json`
+1. **Stage 1** (PySpark / analysis.stage1.run_stage1):
+
+   * Data quality analysis
+   * Binary / multiclass / malware-family feasibility
+   * Graph structure exploration
+   * Unsupervised / autoencoder / clustering / GAN feasibility
+   * Writes summaries and reports to `outputs/stage1_feasibility/`
+
+2. **Stage 2** (PySpark / analysis.stage2.run_stage2):
+
+   * Feature engineering at scale (Spark, can scale to very large traffic logs)
+   * Device-level aggregation
+   * Train/val/test splitting
+   * Writes parquet outputs to `outputs/stage2_prepared/`
+
+### `docker compose run stage2_only`
+
+* Only runs Stage 2:
+
+  * Uses the engineered feature pipeline
+  * Builds parquet datasets + splits for training
+  * Useful when you've already run Stage 1 and just want to regenerate training data
+
+You control when to re-run Stage 2. Stage 1 does not auto-run unless you call `full_pipeline`.
+
+## Configuration
+
+Edit `config.py` to change:
+
+* `DATA_SAMPLE_FRACTION` — how much of the data to sample (0.0–1.0).
+  Example: `1.0` = full data, `0.1` = 10%.
+* `TEST_MODE` — toggle test / dev mode logic in your pipeline.
+* `USE_STRATIFIED_SAMPLING` — choose stratified sampling vs random for the Spark read.
+
+You can also override some runtime behavior through environment variables in `docker-compose.yml`, for example:
+
+```yaml
+environment:
+  - DATA_SAMPLE_FRACTION=1.0
+  - SPARK_DRIVER_MEMORY=8g
+  - SPARK_EXECUTOR_MEMORY=8g
+```
+
+## Memory Settings
+
+By default we give Spark 8g driver / 8g executor in `docker-compose.yml`.
+If you hit OOM, bump memory like this:
+
+```yaml
+environment:
+  - SPARK_DRIVER_MEMORY=16g
+  - SPARK_EXECUTOR_MEMORY=16g
+```
+
+Then rebuild:
+
+```bash
+docker compose down
+docker compose build --no-cache
+```
+
+## Outputs to Check
+
+After it runs, you should see:
+
+* `outputs/stage1_feasibility/summary.json`
+
+  * High-level findings from Stage 1
+
+* `outputs/stage2_prepared/engineered_data.parquet`
+
+  * Feature-engineered Spark dataset
+
+* `outputs/stage2_prepared/splits/train_set.parquet`
+
+* `outputs/stage2_prepared/splits/val_set.parquet`
+
+* `outputs/stage2_prepared/splits/test_set.parquet`
+
+  * Final train/val/test splits ready for modeling
 
 ## Troubleshooting
 
-**No data found error?**
-- Make sure `data/raw_test/` exists with CSV files
-- Check `Config.RAW_DIR_ORIGINAL` in `config.py`
+**It hangs on "Encoding categorical features..."**
 
-**Permission issues?**
+* You’re good now: Stage 2 uses Spark with controlled shuffle partitions and skips insane high-cardinality columns, so that step should complete instead of freezing.
+
+**Out of memory:**
+
 ```bash
-sudo chown -R $USER:$USER stage1_feasibility/
+# Increase Spark memory in docker-compose.yml
+SPARK_DRIVER_MEMORY=16g
+SPARK_EXECUTOR_MEMORY=16g
+docker compose down
+docker compose build --no-cache
 ```
 
-**Rebuild after code changes:**
+**Imports or module not found:**
+
 ```bash
-docker-compose up --build
+# Rebuild the image from scratch to make sure code changes are picked up
+docker compose build --no-cache
 ```
 
-## Environment
-
-- **Python**: 3.9
-- **Java**: OpenJDK 11
-- **PySpark**: 3.5.0+
-- **OS**: Debian-based Linux
-
-## Running Other Scripts
-
-To run different analysis scripts:
+**I just want to rerun Stage 2 with new data but NOT rerun Stage 1:**
 
 ```bash
-# Modify docker-compose.yml command, or:
-docker-compose run stage1-analysis python your_script.py
+docker compose run stage2_only
 ```
 
-## Clean Up
+**I want to run the whole pipeline again from scratch:**
 
 ```bash
-# Remove containers
-docker-compose down
-
-# Remove images
-docker rmi iot23-analysis
-
-# Remove volumes (careful - deletes data!)
-docker-compose down -v
+docker compose run full_pipeline
 ```

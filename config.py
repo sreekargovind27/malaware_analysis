@@ -1,221 +1,276 @@
 """
-This file centralizes all configuration settings for the IoT-23 dataset analysis,
-including file paths, model parameters, and feature definitions.
+Central configuration for IoT-23 pipeline (data prep, modeling, outputs).
+Covers:
+- Paths
+- Sampling / split settings
+- Feature definitions
+- Spark helpers
+- Training hyperparams (for later stages)
 """
-import os
 
+import os
 import joblib
 import torch
 
 
 class Config:
-    # Set to True to use a smaller dataset for testing, False for the full dataset.
+    # ------------------------------------------------------------------
+    # MODE / SAMPLING
+    # ------------------------------------------------------------------
     TEST_MODE = True
 
-    # Paths are dynamically set based on the selected mode.
-    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    # For Spark feature_engineering: take full data or downsample.
+    # 1.0 = use 100% of rows; 0.1 = 10%; etc.
+    DATA_SAMPLE_FRACTION = 1.0
 
-    # Data directories (keep separate - raw data is large)
-    DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+    # If you later implement class-aware sampling during Spark load.
+    USE_STRATIFIED_SAMPLING = True
 
-    # âœ… THE NEW, CLEAN DATA SOURCE FOR THE ENTIRE PIPELINE
-    # Raw data directories
-    # RAW_DIR_MESSY: Original downloaded data with potential inconsistencies
-    # RAW_DIR_ORIGINAL: Standardized, clean data ready for processing
-    RAW_DIR_MESSY = os.path.join(DATA_DIR, 'raw_messy_test' if TEST_MODE else 'raw_messy')
-    RAW_DIR_ORIGINAL = os.path.join(DATA_DIR, 'raw_test' if TEST_MODE else 'raw')
-
-    # ===== OUTPUTS DIRECTORY (NEW) =====
-    OUTPUTS_DIR = os.path.join(PROJECT_ROOT, 'outputs')
-
-    # Stage 1 - Feasibility Analysis
-    STAGE1_FEASIBILITY_DIR = os.path.join(OUTPUTS_DIR, 'stage1_feasibility')
-
-    # Stage 2 - Prepared Data
-    STAGE2_PREPARED_DIR = os.path.join(OUTPUTS_DIR, 'stage2_prepared')
-    STAGE2_QUALITY_DIR = os.path.join(OUTPUTS_DIR, 'stage2_quality')
-    ENGINEERED_DIR = STAGE2_PREPARED_DIR
-    ENGINEERED_SPLIT_DIR = os.path.join(STAGE2_PREPARED_DIR, 'splits')
-
-    # Splits subdirectory
-    SPLITS_DIR = os.path.join(STAGE2_PREPARED_DIR, 'splits')
-
-    # Normalized data subdirectory
-    NORMALIZED_DIR = os.path.join(STAGE2_PREPARED_DIR, 'normalized')
-
-    # Graph data subdirectory (for GNN)
-    GRAPH_DIR = os.path.join(STAGE2_PREPARED_DIR, 'graph')
-
-    # Trained Models
-    MODELS_DIR = os.path.join(OUTPUTS_DIR, 'models_trained')
-    TRADITIONAL_MODELS_DIR = os.path.join(MODELS_DIR, 'traditional')
-    DL_MODELS_DIR = os.path.join(MODELS_DIR, 'deep_learning')
-    GNN_MODELS_DIR = os.path.join(MODELS_DIR, 'gnn')
-    UNSUPERVISED_MODELS_DIR = os.path.join(MODELS_DIR, 'unsupervised')
-
-    # Results
-    RESULTS_DIR = os.path.join(OUTPUTS_DIR, 'results')
-    BINARY_RESULTS_DIR = os.path.join(RESULTS_DIR, 'binary_classification')
-    MULTICLASS_RESULTS_DIR = os.path.join(RESULTS_DIR, 'multiclass')
-    FAMILY_RESULTS_DIR = os.path.join(RESULTS_DIR, 'malware_family')
-    AUTOENCODER_RESULTS_DIR = os.path.join(RESULTS_DIR, 'autoencoder')
-    CLUSTERING_RESULTS_DIR = os.path.join(RESULTS_DIR, 'clustering')
-
-    # Logs
-    LOGS_DIR = os.path.join(OUTPUTS_DIR, 'logs')
-
-    # Feature files
-    ENGINEERED_DATA_PATH = os.path.join(STAGE2_PREPARED_DIR, 'flow_features.parquet')
-    ENGINEERED_DATA_PATH_CSV = os.path.join(STAGE2_PREPARED_DIR, 'flow_features.csv')
-    DEVICE_FEATURES_PATH = os.path.join(STAGE2_PREPARED_DIR, 'device_features.parquet')
-    FEATURE_LIST_PATH = os.path.join(STAGE2_PREPARED_DIR, 'feature_list.joblib')
-    AUTOENCODER_FEATURE_LIST_PATH = os.path.join(STAGE2_PREPARED_DIR, 'autoencoder_feature_list.joblib')
-
-    # Split files
-    TRAIN_SET_PATH = os.path.join(SPLITS_DIR, 'train_flows.parquet')
-    VAL_SET_PATH = os.path.join(SPLITS_DIR, 'val_flows.parquet')
-    TEST_SET_PATH = os.path.join(SPLITS_DIR, 'test_flows.parquet')
-
-    # Scaler
-    SCALER_PATH = os.path.join(NORMALIZED_DIR, 'flow_scaler.pkl')
-
-    # Graph files (for GNN)
-    HETERO_GRAPH_PATH = os.path.join(GRAPH_DIR, 'hetero_graph.pt')
-    DEVICE_NODES_PATH = os.path.join(GRAPH_DIR, 'device_nodes.parquet')
-    SERVICE_NODES_PATH = os.path.join(GRAPH_DIR, 'service_nodes.parquet')
-    SUBNET_NODES_PATH = os.path.join(GRAPH_DIR, 'subnet_nodes.parquet')
-    EDGES_PATH = os.path.join(GRAPH_DIR, 'edges.parquet')
-    GRAPH_STATS_PATH = os.path.join(GRAPH_DIR, 'graph_stats.json')
-    GAN_RESULTS_DIR = os.path.join(RESULTS_DIR, 'gan')
-
-    # Malware family mapping (filename -> family name)
-    FILENAME_TO_FAMILY_MAP = {
-        'CTU-IoT-Malware-Capture-1-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-7-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-8-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-9-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-20-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-21-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-33-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-34-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-35-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-36-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-42-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-43-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-44-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-48-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-49-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-52-1': 'Mirai',
-        'CTU-IoT-Malware-Capture-60-1': 'Mirai',
-
-        'CTU-IoT-Malware-Capture-3-1': 'Kenjiro',
-        'CTU-IoT-Malware-Capture-39-1': 'Kenjiro',
-
-        'CTU-IoT-Malware-Capture-5-1': 'Torii',
-
-        'CTU-IoT-Malware-Capture-17-1': 'Gagfyt',
-        'CTU-IoT-Malware-Capture-41-1': 'Gagfyt',
-        'CTU-IoT-Malware-Capture-51-1': 'Gagfyt',
-
-        'CTU-IoT-Malware-Capture-37-1': 'Okiru',
-
-        'CTU-IoT-Malware-Capture-46-1': 'Muhstik',
-
-        'CTU-IoT-Malware-Capture-40-1': 'Hajime',
-
-        'CTU-IoT-Malware-Capture-53-1': 'Hide and Seek',
-
-        'CTU-IoT-Malware-Capture-54-1': 'Hakai',
-
-        'CTU-IoT-Malware-Capture-55-1': 'IRCBot',
-
-        'CTU-IoT-Malware-Capture-56-1': 'Trojan',
-
-        # Benign captures
-        'CTU-Honeypot-Capture-4-1': 'Benign',
-        'CTU-Honeypot-Capture-5-1': 'Benign',
-        'CTU-Honeypot-Capture-7-1': 'Benign',
-    }
-
-    # Data processing and sampling settings.
-    SAMPLE_SIZE = 50000000
-    TEST_SIZE = 0.2
+    # Random seed for splits, sampling, model init, etc.
     RANDOM_STATE = 42
 
-    # Feature definitions used during data engineering.
-    BASE_NUMERICAL_FEATURES = ['duration', 'orig_bytes', 'resp_bytes', 'orig_pkts', 'resp_pkts', 'orig_ip_bytes',
-                               'resp_ip_bytes', 'missed_bytes', 'id_resp_p']
-    SKEWED_NUMERICAL_FEATURES = ['duration', 'orig_bytes', 'resp_bytes', 'orig_pkts', 'resp_pkts', 'orig_ip_bytes',
-                                 'resp_ip_bytes']
-    CATEGORICAL_LABEL_ENCODE = ['service', 'history']
-    CATEGORICAL_ONE_HOT_ENCODE = ['proto', 'conn_state']
-    IP_FEATURES_BASE = ['is_private', 'is_broadcast', 'is_multicast', 'ip_first_octet', 'is_localhost']
-    ENGINEERED_FEATURES = [
-        'is_port_23', 'is_port_22', 'is_S0_state', 'is_telnet',
-        'is_unknown_service', 'upload_ratio', 'bytes_per_packet',
-        'packet_rate', 'is_scanning_signature', 'suspicious_score'
+    # ------------------------------------------------------------------
+    # PROJECT ROOTS / IO PATHS
+    # ------------------------------------------------------------------
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
+    RAW_DIR_MESSY = os.path.join(
+        DATA_DIR, "raw_messy_test" if TEST_MODE else "raw_messy"
+    )
+    RAW_DIR_ORIGINAL = os.path.join(
+        DATA_DIR, "raw_test" if TEST_MODE else "raw"
+    )
+
+    OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
+
+    # Stage 1 (exploration / sanity reports)
+    STAGE1_FEASIBILITY_DIR = os.path.join(OUTPUTS_DIR, "stage1_feasibility")
+
+    # Stage 2 (engineered features, splits, graphs, quality checks)
+    STAGE2_PREPARED_DIR = os.path.join(OUTPUTS_DIR, "stage2_prepared")
+    STAGE2_QUALITY_DIR = os.path.join(OUTPUTS_DIR, "stage2_quality")
+
+    ENGINEERED_DIR = STAGE2_PREPARED_DIR
+    SPLITS_DIR = os.path.join(STAGE2_PREPARED_DIR, "splits")
+    NORMALIZED_DIR = os.path.join(STAGE2_PREPARED_DIR, "normalized")
+    GRAPH_DIR = os.path.join(STAGE2_PREPARED_DIR, "graph")
+
+    # Models (Stage 3+)
+    MODELS_DIR = os.path.join(OUTPUTS_DIR, "models_trained")
+    TRADITIONAL_MODELS_DIR = os.path.join(MODELS_DIR, "traditional")
+    DL_MODELS_DIR = os.path.join(MODELS_DIR, "deep_learning")
+    GNN_MODELS_DIR = os.path.join(MODELS_DIR, "gnn")
+    UNSUPERVISED_MODELS_DIR = os.path.join(MODELS_DIR, "unsupervised")
+
+    # Results / reports
+    RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
+    BINARY_RESULTS_DIR = os.path.join(RESULTS_DIR, "binary_classification")
+    MULTICLASS_RESULTS_DIR = os.path.join(RESULTS_DIR, "multiclass")
+    FAMILY_RESULTS_DIR = os.path.join(RESULTS_DIR, "malware_family")
+    AUTOENCODER_RESULTS_DIR = os.path.join(RESULTS_DIR, "autoencoder")
+    CLUSTERING_RESULTS_DIR = os.path.join(RESULTS_DIR, "clustering")
+    GAN_RESULTS_DIR = os.path.join(RESULTS_DIR, "gan")
+
+    LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
+
+    # ------------------------------------------------------------------
+    # STAGE 2 OUTPUT ARTIFACTS
+    # ------------------------------------------------------------------
+    ENGINEERED_DATA_PATH = os.path.join(
+        STAGE2_PREPARED_DIR, "flow_features.parquet"
+    )
+    ENGINEERED_DATA_PATH_CSV = os.path.join(
+        STAGE2_PREPARED_DIR, "flow_features.csv"
+    )
+
+    DEVICE_FEATURES_PATH = os.path.join(
+        STAGE2_PREPARED_DIR, "device_features.parquet"
+    )
+
+    FEATURE_LIST_PATH = os.path.join(
+        STAGE2_PREPARED_DIR, "feature_list.joblib"
+    )
+    AUTOENCODER_FEATURE_LIST_PATH = os.path.join(
+        STAGE2_PREPARED_DIR, "autoencoder_feature_list.joblib"
+    )
+
+    TRAIN_SET_PATH = os.path.join(SPLITS_DIR, "train_flows.parquet")
+    VAL_SET_PATH = os.path.join(SPLITS_DIR, "val_flows.parquet")
+    TEST_SET_PATH = os.path.join(SPLITS_DIR, "test_flows.parquet")
+
+    SCALER_PATH = os.path.join(NORMALIZED_DIR, "flow_scaler.pkl")
+
+    # Graph / GNN artifacts
+    HETERO_GRAPH_PATH = os.path.join(GRAPH_DIR, "hetero_graph.pt")
+    DEVICE_NODES_PATH = os.path.join(GRAPH_DIR, "device_nodes.parquet")
+    SERVICE_NODES_PATH = os.path.join(GRAPH_DIR, "service_nodes.parquet")
+    SUBNET_NODES_PATH = os.path.join(GRAPH_DIR, "subnet_nodes.parquet")
+    EDGES_PATH = os.path.join(GRAPH_DIR, "edges.parquet")
+    GRAPH_STATS_PATH = os.path.join(GRAPH_DIR, "graph_stats.json")
+
+    # ------------------------------------------------------------------
+    # DATASET / LABEL SEMANTICS
+    # ------------------------------------------------------------------
+    SAMPLE_SIZE = 50_000_000
+    TEST_SIZE = 0.2
+
+    FILENAME_TO_FAMILY_MAP = {
+        "CTU-IoT-Malware-Capture-1-1": "Mirai",
+        "CTU-IoT-Malware-Capture-7-1": "Mirai",
+        "CTU-IoT-Malware-Capture-8-1": "Mirai",
+        "CTU-IoT-Malware-Capture-9-1": "Mirai",
+        "CTU-IoT-Malware-Capture-20-1": "Mirai",
+        "CTU-IoT-Malware-Capture-21-1": "Mirai",
+        "CTU-IoT-Malware-Capture-33-1": "Mirai",
+        "CTU-IoT-Malware-Capture-34-1": "Mirai",
+        "CTU-IoT-Malware-Capture-35-1": "Mirai",
+        "CTU-IoT-Malware-Capture-36-1": "Mirai",
+        "CTU-IoT-Malware-Capture-42-1": "Mirai",
+        "CTU-IoT-Malware-Capture-43-1": "Mirai",
+        "CTU-IoT-Malware-Capture-44-1": "Mirai",
+        "CTU-IoT-Malware-Capture-48-1": "Mirai",
+        "CTU-IoT-Malware-Capture-49-1": "Mirai",
+        "CTU-IoT-Malware-Capture-52-1": "Mirai",
+        "CTU-IoT-Malware-Capture-60-1": "Mirai",
+        "CTU-IoT-Malware-Capture-3-1": "Kenjiro",
+        "CTU-IoT-Malware-Capture-39-1": "Kenjiro",
+        "CTU-IoT-Malware-Capture-5-1": "Torii",
+        "CTU-IoT-Malware-Capture-17-1": "Gagfyt",
+        "CTU-IoT-Malware-Capture-41-1": "Gagfyt",
+        "CTU-IoT-Malware-Capture-51-1": "Gagfyt",
+        "CTU-IoT-Malware-Capture-37-1": "Okiru",
+        "CTU-IoT-Malware-Capture-46-1": "Muhstik",
+        "CTU-IoT-Malware-Capture-40-1": "Hajime",
+        "CTU-IoT-Malware-Capture-53-1": "Hide and Seek",
+        "CTU-IoT-Malware-Capture-54-1": "Hakai",
+        "CTU-IoT-Malware-Capture-55-1": "IRCBot",
+        "CTU-IoT-Malware-Capture-56-1": "Trojan",
+        "CTU-Honeypot-Capture-4-1": "Benign",
+        "CTU-Honeypot-Capture-5-1": "Benign",
+        "CTU-Honeypot-Capture-7-1": "Benign",
+    }
+
+    # ------------------------------------------------------------------
+    # FEATURE DEFINITIONS
+    # ------------------------------------------------------------------
+    BASE_NUMERICAL_FEATURES = [
+        "duration",
+        "orig_bytes",
+        "resp_bytes",
+        "orig_pkts",
+        "resp_pkts",
+        "orig_ip_bytes",
+        "resp_ip_bytes",
+        "missed_bytes",
+        "id.resp_p",  # port, cast to double + _was_missing
     ]
 
-    # Target column names.
-    TARGET_COL = 'label'
-    DETAILED_TARGET_COL = 'attack_type'
-    FAMILY_TARGET_COL = 'malware_family'
+    SKEWED_NUMERICAL_FEATURES = [
+        "duration",
+        "orig_bytes",
+        "resp_bytes",
+        "orig_pkts",
+        "resp_pkts",
+        "orig_ip_bytes",
+        "resp_ip_bytes",
+    ]
+
+    # (Informational; Stage 2 currently builds these manually.)
+    CATEGORICAL_LABEL_ENCODE = ["service", "history"]
+    CATEGORICAL_ONE_HOT_ENCODE = ["proto", "conn_state"]
+
+    # (Informational; Stage 2 derives orig_/resp_ private/multicast/etc.)
+    IP_FEATURES_BASE = [
+        "is_private",
+        "is_broadcast",
+        "is_multicast",
+        "ip_first_octet",
+        "is_localhost",
+    ]
+
+    # Features we engineer in Stage 2
+    ENGINEERED_FEATURES = [
+        "is_port_23",
+        "is_port_22",
+        "is_S0_state",
+        "is_telnet",
+        "is_unknown_service",
+        "upload_ratio",
+        "bytes_per_packet",
+        "packet_rate",
+        "suspicious_score",
+    ]
+
+    # Targets we predict
+    TARGET_COL = "label"
+    DETAILED_TARGET_COL = "attack_type"
+    FAMILY_TARGET_COL = "malware_family"
 
     @staticmethod
     def get_feature_list():
         if os.path.exists(Config.FEATURE_LIST_PATH):
             return joblib.load(Config.FEATURE_LIST_PATH)
-        print(f"Warning: Feature list not found. Run build_dataset.py.")
+        print("Warning: Feature list not found on disk.")
         return []
 
-    # Settings for handling class imbalance and hyperparameter optimization.
+    # ------------------------------------------------------------------
+    # TRAINING / MODELING HYPERPARAMS
+    # ------------------------------------------------------------------
     USE_SMOTE = True
-    SMOTE_SAMPLE_THRESHOLD = 100000
+    SMOTE_SAMPLE_THRESHOLD = 100_000
+
     USE_OPTUNA = True
     OPTUNA_N_TRIALS = 20
     OPTUNA_TIMEOUT = 300
-    RUN_LOGISTIC_REGRESSION = True  # Enables the baseline model in binary_classifier.py.
 
-    # Hardware and model-specific hyperparameters.
+    RUN_LOGISTIC_REGRESSION = True
+
     if torch.cuda.is_available():
-        DEVICE = 'cuda'
+        DEVICE = "cuda"
     elif torch.backends.mps.is_available():
-        DEVICE = 'mps'
+        DEVICE = "mps"
     else:
-        DEVICE = 'cpu'
+        DEVICE = "cpu"
 
-    NOISE_START = 0.05  # Starting noise factor
-    NOISE_WARMUP_EPOCHS = 40  # Epochs to ramp from start to final noise
-
-    # WGAN-GP semi-supervised settings
+    NOISE_START = 0.05
+    NOISE_WARMUP_EPOCHS = 40
     GAN_USE_MALICIOUS = True
     GAN_MALICIOUS_RATIO = 0.1
     GAN_MALICIOUS_WEIGHT = 0.2
-    GAN_TEST_INJECTION_RATES = True  # Set True to run grid search
+    GAN_TEST_INJECTION_RATES = True
 
     AUTOENCODER_LATENT_DIM = 8
     AUTOENCODER_EPOCHS = 100
-    AUTOENCODER_BATCH_SIZE = 4096  # instead of 32768
-    AUTOENCODER_LR = 1e-3  # calm LR, Optuna will tune within [1e-4, 5e-3]
+    AUTOENCODER_BATCH_SIZE = 4096
+    AUTOENCODER_LR = 1e-3
+
     USE_LATENT_SPARSITY = True
     SPARSITY_WARMUP_EPOCHS = 30
     LATENT_SPARSITY_LAMBDA = 1e-3
+
     BINARY_N_ESTIMATORS = 200
     BINARY_LEARNING_RATE = 0.1
     BINARY_NUM_LEAVES = 50
+
     MULTICLASS_N_ESTIMATORS = 200
     MULTICLASS_LEARNING_RATE = 0.1
-    XGB_TREE_METHOD = "hist"
     MULTICLASS_MAX_DEPTH = 10
+    XGB_TREE_METHOD = "hist"
+
     KMEANS_N_CLUSTERS = 5
-    KMEANS_BATCH_SIZE = 10000
+    KMEANS_BATCH_SIZE = 10_000
+
     NUM_WORKERS = 2
     PIN_MEMORY = True
     N_JOBS = 32
 
+    # ------------------------------------------------------------------
+    # UTIL FUNCS
+    # ------------------------------------------------------------------
     @staticmethod
     def ensure_output_dirs():
-        """Create output directories if they don't exist. Call this at the start of each script."""
         for dir_path in [
             Config.RAW_DIR_MESSY,
             Config.RAW_DIR_ORIGINAL,
@@ -234,13 +289,13 @@ class Config:
             Config.FAMILY_RESULTS_DIR,
             Config.AUTOENCODER_RESULTS_DIR,
             Config.CLUSTERING_RESULTS_DIR,
-            Config.LOGS_DIR
+            Config.GAN_RESULTS_DIR,
+            Config.LOGS_DIR,
         ]:
             os.makedirs(dir_path, exist_ok=True)
 
     @staticmethod
     def set_seeds():
-        """Sets random seeds for reproducibility across libraries."""
         import random
         import numpy as np
         random.seed(Config.RANDOM_STATE)
@@ -252,31 +307,28 @@ class Config:
     @staticmethod
     def get_spark_session(app_name="IoT23-Analysis"):
         """
-        Get or create Spark session for analysis.
-        Works both locally and on Databricks.
+        Build or get a SparkSession tuned for our pipeline scale.
+        Adjust memory/partitions here if you hit OOM or want more parallelism.
         """
-        try:
-            # Try to get existing session (works on Databricks)
-            from pyspark.sql import SparkSession
-            spark = SparkSession.builder.getOrCreate()
-            return spark
-        except:
-            # Create new session (works locally)
-            from pyspark.sql import SparkSession
-            spark = SparkSession.builder \
-                .appName(app_name) \
-                .config("spark.driver.memory", "8g") \
-                .config("spark.sql.shuffle.partitions", "200") \
-                .getOrCreate()
-            return spark
+        from pyspark.sql import SparkSession
+        spark = (
+            SparkSession.builder
+            .appName(app_name)
+            .config("spark.driver.memory", "8g")
+            .config("spark.sql.shuffle.partitions", "20")
+            .config("spark.default.parallelism", "8")
+            .config("spark.ui.showConsoleProgress", "true")
+            .getOrCreate()
+        )
+        spark.sparkContext.setLogLevel("WARN")
+        return spark
 
     @staticmethod
     def print_mode_info():
-        """Prints the current configuration mode to the console."""
         print("\n" + "=" * 70)
-        print("Ã¢Å¡â„¢Ã¯Â¸Â  CONFIGURATION MODE")
+        print("CONFIGURATION MODE")
         print("=" * 70)
-        mode = "TEST MODE Ã°Å¸Â§Âª" if Config.TEST_MODE else "PRODUCTION MODE Ã°Å¸Å¡â‚¬"
+        mode = "TEST MODE" if Config.TEST_MODE else "PRODUCTION MODE"
         print(f"   Mode: {mode}")
         print(f"   Raw Data Directory: {Config.RAW_DIR_ORIGINAL}")
         print(f"   Device: {Config.DEVICE}")

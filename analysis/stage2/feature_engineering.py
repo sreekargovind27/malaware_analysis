@@ -1,359 +1,607 @@
-# In analysis/stage2/feature_engineering.py
+"""
+Stage 2: Feature Engineering - PySpark Version
+Reimplements the original pandas pipeline faithfully in Spark.
 
-import glob
+What we do:
+- tolerant CSV load across inconsistent IoT-23 headers
+- label parsing (label / attack_type / malware_family / attack_subtype)
+- numeric cleanup + _was_missing + log1p
+- IP-derived features (per orig/resp, plus device_ip)
+- custom behavioral features (upload_ratio, packet_rate, suspicious_score, etc.)
+- categorical encoding
+    - service/history => label index
+    - proto/conn_state => one-hot vecs
+    - is_S0_state, suspicious_score
+- final column list is saved to feature_list.joblib for later steps
+- write unified parquet to Config.ENGINEERED_DATA_PATH
+"""
+
 import os
-import re
-import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
-
 import joblib
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
 
-# Add project root to path to import Config
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml import Pipeline
+
 from config import Config
 
-CHUNK_SIZE = 1_000_000
-MAX_WORKERS = min(16, cpu_count())
+
+# --------------------------------------------------------------------------------
+# RAW LOAD (tolerant to messy IoT-23 headers)
+# --------------------------------------------------------------------------------
+def load_raw_flows(spark):
+    """
+    Read ALL CSVs from Config.RAW_DIR_ORIGINAL.
+    Tolerant to inconsistent headers.
+    Normalizes expected columns, enforces types, and adds Source_Folder.
+    """
+    input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+    print(f"📂 Reading raw CSVs from {input_glob}")
+
+    df = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", True)
+        .option("comment", "#")
+        .option("mode", "PERMISSIVE")
+        .csv(input_glob)
+    )
+
+    # keep which capture each row came from
+    df = df.withColumn(
+        "Source_Folder",
+        F.regexp_extract(F.input_file_name(), r"([^/]+)\.csv$", 1)
+    )
+
+    # All columns we expect downstream
+    expected_cols = [
+        "ts", "uid",
+        "id.orig_h", "id.orig_p",
+        "id.resp_h", "id.resp_p",
+        "proto", "service",
+        "duration",
+        "orig_bytes", "resp_bytes",
+        "conn_state",
+        "local_orig", "local_resp",
+        "missed_bytes",
+        "history",
+        "orig_pkts", "orig_ip_bytes",
+        "resp_pkts", "resp_ip_bytes",
+        "label", "detailed-label",
+    ]
+
+    # map underscore forms -> dotted forms if needed
+    existing_cols = df.columns
+    for col_dot in expected_cols:
+        alt = col_dot.replace(".", "_").replace("-", "_")
+        if col_dot not in existing_cols and alt in existing_cols:
+            df = df.withColumnRenamed(alt, col_dot)
+
+    # ensure missing expected cols exist
+    for c in expected_cols:
+        if c not in df.columns:
+            df = df.withColumn(c, F.lit(None).cast("string"))
+
+    # helper: safely cast dotted numeric columns
+    def safe_cast_numeric(df_in, col_name, target_type):
+        """
+        Spark hates withColumn('a.b', ...) because it parses `a`.`b`.
+        Workaround:
+        - create temp col with underscore
+        - drop original
+        - rename temp back
+        Only run this if the column actually exists.
+        """
+        if col_name not in df_in.columns:
+            return df_in
+
+        temp_col = col_name.replace(".", "_") + "__casttmp"
+
+        # Use backticks to escape column names with dots
+        df_tmp = df_in.withColumn(temp_col, F.col(f"`{col_name}`").cast(target_type))
+        df_tmp = df_tmp.drop(col_name)
+        df_tmp = df_tmp.withColumnRenamed(temp_col, col_name)
+        return df_tmp
+
+    # cast integer-ish columns to long
+    int_like = [
+        "id.orig_p", "id.resp_p",
+        "orig_bytes", "resp_bytes",
+        "orig_pkts", "resp_pkts",
+        "orig_ip_bytes", "resp_ip_bytes",
+        "missed_bytes",
+    ]
+    for c in int_like:
+        df = safe_cast_numeric(df, c, "long")
+
+    # cast duration, ts to double
+    df = safe_cast_numeric(df, "duration", "double")
+    df = safe_cast_numeric(df, "ts", "double")
+
+    # local_orig/local_resp -> 0/1 int
+    for c in ["local_orig", "local_resp"]:
+        if c in df.columns:
+            # Cast to string first, then check for "1", "T", "true" (case-insensitive)
+            df = df.withColumn(
+                c,
+                F.when(
+                    F.upper(F.col(c).cast("string")).isin("1", "T", "TRUE"),
+                    F.lit(1)
+                )
+                .otherwise(F.lit(0))
+                .cast("int")
+            )
+
+    return df
 
 
-def scan_single_file(file_path):
-    """Scans a single file to extract unique values from categorical columns."""
-    proto_values, conn_state_values = set(), set()
-    try:
-        df_sample = pd.read_csv(file_path, usecols=['proto', 'conn_state'], low_memory=False, on_bad_lines='skip',
-                                comment='#')
-        if 'proto' in df_sample.columns:
-            proto_values.update(
-                df_sample['proto'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
-        if 'conn_state' in df_sample.columns:
-            conn_state_values.update(
-                df_sample['conn_state'].fillna('unknown').astype(str).replace(['-', '', 'nan', 'None'], 'unknown'))
-    except Exception as e:
-        tqdm.write(f"  Warning: Could not scan {os.path.basename(file_path)}: {e}")
-    return proto_values, conn_state_values
+# --------------------------------------------------------------------------------
+# LABEL PARSING (Stage1-aligned logic, Spark-safe)
+# --------------------------------------------------------------------------------
+def clean_and_expand_labels(df):
+    """
+    Produces:
+      - label ("Benign"/"Malicious")
+      - attack_type (PortScan, C&C, DDoS, Malware, etc.; "Benign" if benign)
+      - malware_family (Mirai / Okiru / Torii / Kenjiro / Hajime / etc.)
+      - attack_subtype (HeartBeat, FileDownload)
+    """
+    print("🧠 Cleaning / expanding labels...")
+
+    # Build combined text ONCE using both label and detailed-label
+    combined_expr = F.lower(
+        F.concat_ws(
+            " ",
+            F.coalesce(F.col("label"), F.lit("")),
+            F.coalesce(F.col("`detailed-label`"), F.lit(""))
+        )
+    )
+    combined_expr = F.regexp_replace(combined_expr, r"\(empty\)", "")
+    combined_expr = F.regexp_replace(combined_expr, r"-", " ")
+    combined_expr = F.trim(combined_expr)
+
+    # cache it on the df
+    df = df.withColumn("combined_text", combined_expr)
+
+    # 1. Binary label
+    df = df.withColumn(
+        "label",
+        F.when(F.col("combined_text").contains("malicious"), "Malicious")
+        .when(F.col("combined_text").contains("benign"), "Benign")
+        .when(
+            (F.col("label").isNotNull()) &
+            (F.col("label") != "") &
+            (F.col("label") != "-"),
+            F.when(F.lower(F.col("label")).contains("malicious"), "Malicious")
+            .when(F.lower(F.col("label")).contains("benign"), "Benign")
+            .otherwise(F.lit(None).cast("string"))
+        )
+        .otherwise(F.lit(None).cast("string"))
+    )
+
+    # 2. Initial malware_family guess from free text
+    df = df.withColumn(
+        "malware_family",
+        F.when(F.col("combined_text").rlike("mirai"), "Mirai")
+        .when(F.col("combined_text").rlike("okiru"), "Okiru")
+        .when(F.col("combined_text").rlike("torii"), "Torii")
+        .when(F.col("combined_text").rlike("kenjiro"), "Kenjiro")
+        .when(F.col("combined_text").rlike("hajime"), "Hajime")
+        .when(F.col("combined_text").rlike("gagfyt|gafgyt"), "Gagfyt")
+        .when(F.col("combined_text").rlike("muhstik"), "Muhstik")
+        .when(F.col("combined_text").rlike("hakai"), "Hakai")
+        .when(F.col("combined_text").rlike("ircbot"), "IRCBot")
+        .when(F.col("combined_text").rlike("hide.*seek|hideandseek"), "Hide and Seek")
+        .when(F.col("combined_text").rlike("trojan"), "Trojan")
+        .otherwise(F.lit(None).cast("string"))
+    )
+
+    # 3. attack_subtype
+    df = df.withColumn(
+        "attack_subtype",
+        F.when(F.col("combined_text").rlike("heartbeat"), "HeartBeat")
+        .when(F.col("combined_text").rlike("filedownload"), "FileDownload")
+        .otherwise(F.lit(None).cast("string"))
+    )
+
+    # 4. filename-based malware_family override (ground truth per capture)
+    print("🗂️  Applying filename-based family labels (ground truth)...")
+
+    family_map = Config.FILENAME_TO_FAMILY_MAP
+
+    @F.udf(T.StringType())
+    def get_family_from_filename(source_folder):
+        return family_map.get(source_folder, None)
+
+    df = df.withColumn(
+        "malware_family_filename",
+        get_family_from_filename(F.col("Source_Folder"))
+    )
+
+    df = df.withColumn(
+        "malware_family",
+        F.when(
+            F.col("label") == "Malicious",
+            F.coalesce(F.col("malware_family_filename"), F.col("malware_family"))
+        ).otherwise(F.lit(None).cast("string"))
+    )
+
+    # 5. attack_type (fine-grained, Stage1-style)
+    # Priority order matters. We try the specific ones first.
+    df = df.withColumn(
+        "attack_type",
+        F.when(F.col("label") == "Benign", "Benign")
+        .when(
+            F.col("combined_text").contains("portscan") |
+            F.col("combined_text").contains("partofahorizontalportscan"),
+            "PortScan"
+        )
+        .when(
+            F.col("combined_text").contains("c&c") |
+            F.col("combined_text").contains("c2"),
+            "C&C"
+        )
+        .when(
+            F.col("combined_text").contains("ddos"),
+            "DDoS"
+        )
+        .when(
+            F.col("combined_text").contains("filedownload"),
+            "FileDownload"
+        )
+        .when(
+            F.col("combined_text").contains("attack"),
+            "Attack"
+        )
+        # fallback bucket for malicious that didn't match above
+        .when(F.col("label") == "Malicious", "Malware")
+        .otherwise("Unknown")
+    )
+
+    # 6. now safe to drop helper cols
+    df = df.drop("detailed-label", "combined_text", "malware_family_filename")
+
+    print("✓ Labels parsed into {label, attack_type, attack_subtype, malware_family}")
+    print("✓ Malware families assigned from filenames (ground truth)")
+    return df
 
 
-def scan_categorical_values(csv_files):
-    """Scans all CSV files in parallel to build a schema of all possible categorical values."""
-    print("\n" + "=" * 70)
-    print("🔍 SCANNING FILES FOR CATEGORICAL VALUES (Parallel)")
-    print("=" * 70)
-    all_proto_values, all_conn_state_values = set(), set()
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scan_single_file, fp): fp for fp in csv_files}
-        for future in tqdm(as_completed(futures), total=len(csv_files), desc="Scanning files"):
-            proto_vals, conn_vals = future.result()
-            all_proto_values.update(proto_vals)
-            all_conn_state_values.update(conn_vals)
-    print(f"\n✅ Schema discovery complete.")
-    return {'proto': sorted(all_proto_values), 'conn_state': sorted(all_conn_state_values)}
+# --------------------------------------------------------------------------------
+# NUMERIC FEATURE CLEANUP
+# --------------------------------------------------------------------------------
+def engineer_numeric_features(df):
+    """
+    For every col in Config.BASE_NUMERICAL_FEATURES:
+      - create <col>_was_missing (1 if null, else 0)
+      - fill null/negative with 0
+      - cast to double
+      - log1p skewed cols in Config.SKEWED_NUMERICAL_FEATURES
+      - if column didn't exist at all, create it with zeros + was_missing=1
+    """
+    print("🔧 Engineering numeric/base features...")
+
+    for col_name in Config.BASE_NUMERICAL_FEATURES:
+        if col_name in df.columns:
+            col_ref = f"`{col_name}`"
+
+            # mark missing
+            df = df.withColumn(
+                f"{col_name}_was_missing",
+                F.when(F.col(col_ref).isNull(), 1).otherwise(0).cast("int")
+            )
+
+            # clamp negatives/nulls -> 0, cast to double
+            df = df.withColumn(
+                col_name,
+                F.when(F.col(col_ref).isNull(), 0)
+                .when(F.col(col_ref) < 0, 0)
+                .otherwise(F.col(col_ref).cast("double"))
+            )
+
+            # log1p on the CLEANED version
+            if col_name in Config.SKEWED_NUMERICAL_FEATURES:
+                df = df.withColumn(col_name, F.log1p(F.col(col_name)))
+
+        else:
+            # column missing completely
+            df = (
+                df.withColumn(col_name, F.lit(0.0).cast("double"))
+                .withColumn(f"{col_name}_was_missing", F.lit(1).cast("int"))
+            )
+
+    return df
 
 
-def process_single_csv(args):
-    """Wrapper function for parallel processing."""
-    file_path, all_categorical_values = args
-    file_key = os.path.basename(file_path).replace('.csv', '')
-    return process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values)
+# --------------------------------------------------------------------------------
+# IP FEATURES
+# --------------------------------------------------------------------------------
+def extract_ip_features(df):
+    print("🌐 Extracting IP features...")
 
+    def first_octet_expr(col):
+        return F.split(col, r"\.").getItem(0).cast("int")
 
-def extract_ip_features(ip_series):
-    """Extracts network-related features from a series of IP addresses."""
+    def second_octet_expr(col):
+        return F.split(col, r"\.").getItem(1).cast("int")
 
-    def parse_ip(ip_str):
-        if pd.isna(ip_str) or ip_str in ['-', ''] or ':' in str(ip_str): return [0, 0, 0, 0, 0]
-        try:
-            octets = str(ip_str).split('.')
-            if len(octets) != 4: return [0, 0, 0, 0, 0]
-            first = int(octets[0])
-            is_private = 1 if first == 10 or first == 192 or (first == 172 and 16 <= int(octets[1]) <= 31) else 0
-            is_broadcast = 1 if ip_str == '255.255.255.255' else 0
-            is_multicast = 1 if 224 <= first <= 239 else 0
-            is_localhost = 1 if first == 127 else 0
-            return [is_private, is_broadcast, is_multicast, first, is_localhost]
-        except (ValueError, IndexError):
-            return [0, 0, 0, 0, 0]
-
-    ip_features = ip_series.apply(parse_ip)
-    return pd.DataFrame(ip_features.tolist(), columns=Config.IP_FEATURES_BASE, index=ip_series.index)
-
-
-def _clean_and_expand_labels(df):
-    """Cleans and expands the 'label' and 'detailed-label' columns into structured target columns."""
-    has_label_col = 'label' in df.columns and 'detailed-label' in df.columns
-    if has_label_col:
-        combined_str = (df['label'].astype(str).fillna('') + ' ' + df['detailed-label'].astype(str).fillna(
-            '')).str.lower().str.strip()
+    # preserve device_ip for downstream aggregation & graph
+    if "id.orig_h" in df.columns:
+        df = df.withColumn("device_ip", F.col("`id.orig_h`").cast("string"))
+    elif "id_orig_h" in df.columns:
+        df = df.withColumn("device_ip", F.col("id_orig_h").cast("string"))
     else:
-        combined_str = pd.Series([''] * len(df))
+        df = df.withColumn("device_ip", F.lit(None).cast("string"))
 
-    # Remove literal "(empty)" markers that appear in some files
-    combined_str = combined_str.str.replace(r'\(empty\)', '', regex=True).str.strip()
+    for prefix, ip_col in [("orig", "id.orig_h"), ("resp", "id.resp_h")]:
+        if ip_col not in df.columns:
+            continue
 
-    df['label'] = 'Benign'
-    df.loc[combined_str.str.contains('malicious', na=False), 'label'] = 'Malicious'
-    df['attack_type'] = 'Benign'
-    df['attack_subtype'] = pd.NA
-    df['malware_family'] = pd.NA
+        col_ref = f"`{ip_col}`"
+        clean_ip = F.coalesce(F.col(col_ref).cast("string"), F.lit("0.0.0.0"))
 
-    malicious_mask = df['label'] == 'Malicious'
-    if not malicious_mask.any():
-        if 'detailed-label' in df.columns: df = df.drop(columns=['detailed-label'], errors='ignore')
-        return df
+        first_oct = first_octet_expr(clean_ip)
+        second_oct = second_octet_expr(clean_ip)
 
-    malicious_labels = combined_str[malicious_mask]
-    patterns = {
-        'attack_type': {'C&C': re.compile(r'c&c'), 'DDoS': re.compile(r'ddos'),
-                        'PortScan': re.compile(r'partofahorizontalportscan|portscan'), 'Attack': re.compile(r'attack'),
-                        'FileDownload': re.compile(r'filedownload')},
-        'malware_family': {'Mirai': re.compile(r'mirai'), 'Okiru': re.compile(r'okiru'), 'Torii': re.compile(r'torii')},
-        'attack_subtype': {'HeartBeat': re.compile(r'heartbeat'), 'FileDownload': re.compile(r'filedownload')}
+        df = df.withColumn(
+            f"{prefix}_is_private",
+            (
+                    (first_oct == 10) |
+                    (first_oct == 192) |
+                    ((first_oct == 172) & (second_oct.between(16, 31)))
+            ).cast("int")
+        )
+
+        df = df.withColumn(
+            f"{prefix}_is_broadcast",
+            (clean_ip == F.lit("255.255.255.255")).cast("int")
+        )
+
+        df = df.withColumn(
+            f"{prefix}_is_multicast",
+            ((first_oct >= 224) & (first_oct <= 239)).cast("int")
+        )
+
+        df = df.withColumn(
+            f"{prefix}_is_localhost",
+            (first_oct == 127).cast("int")
+        )
+
+        df = df.withColumn(
+            f"{prefix}_ip_first_octet",
+            first_oct
+        )
+
+    # DO NOT drop id.resp_h / id.orig_h
+    # graph builder consumes them
+    return df
+
+
+# --------------------------------------------------------------------------------
+# CUSTOM / BEHAVIORAL FEATURES
+# --------------------------------------------------------------------------------
+def engineer_custom_features(df):
+    print("🛠 Creating traffic behavior features...")
+
+    total_bytes = (F.col("orig_bytes") + F.col("resp_bytes")).cast("double")
+    total_pkts = (F.col("orig_pkts") + F.col("resp_pkts")).cast("double")
+
+    # upload_ratio
+    df = df.withColumn(
+        "upload_ratio",
+        (F.col("orig_bytes").cast("double") / (total_bytes + F.lit(1e-9)))
+    )
+
+    # bytes_per_packet
+    df = df.withColumn(
+        "bytes_per_packet",
+        (total_bytes / (total_pkts + F.lit(1e-9)))
+    )
+
+    # packet_rate
+    safe_duration = F.expm1(F.col("duration"))
+    safe_duration = F.when(safe_duration < 0.001, 0.001).otherwise(safe_duration)
+
+    df = df.withColumn(
+        "packet_rate",
+        F.when(
+            safe_duration > 0,
+            (total_pkts / safe_duration).cast("double")
+        ).otherwise(F.lit(0.0))
+    )
+
+    # clip packet_rate to 10000
+    df = df.withColumn(
+        "packet_rate",
+        F.when(F.col("packet_rate") > 10000, 10000.0)
+        .otherwise(F.col("packet_rate"))
+    )
+
+    # port-based flags
+    df = df.withColumn("is_port_23", (F.col("`id.resp_p`") == 23).cast("int"))
+    df = df.withColumn("is_port_22", (F.col("`id.resp_p`") == 22).cast("int"))
+
+    # placeholders from pandas
+    df = df.withColumn("is_telnet", F.lit(0).cast("int"))
+    df = df.withColumn("is_unknown_service", F.lit(0).cast("int"))
+
+    return df
+
+
+# --------------------------------------------------------------------------------
+# CATEGORICAL ENCODING
+# --------------------------------------------------------------------------------
+def engineer_categorical_features(df):
+    print("🏅 Encoding categorical features...")
+
+    def normalize(colname):
+        return F.when(
+            F.col(colname).isNull() |
+            (F.col(colname) == "") |
+            (F.col(colname) == "-") |
+            (F.col(colname) == "nan") |
+            (F.col(colname) == "None"),
+            F.lit("unknown")
+        ).otherwise(F.col(colname).cast("string"))
+
+    for c in ["proto", "conn_state", "service", "history"]:
+        if c in df.columns:
+            df = df.withColumn(c, normalize(c))
+        else:
+            df = df.withColumn(c, F.lit("unknown"))
+
+    stages = []
+
+    # service/history -> index only
+    for c in ["service", "history"]:
+        idx_col = f"{c}_idx"
+        stages.append(
+            StringIndexer(
+                inputCol=c,
+                outputCol=idx_col,
+                handleInvalid="keep"
+            )
+        )
+
+    # proto/conn_state -> OHE
+    for c in ["proto", "conn_state"]:
+        idx_col = f"{c}_idx"
+        vec_col = f"{c}_vec"
+        stages.append(
+            StringIndexer(
+                inputCol=c,
+                outputCol=idx_col,
+                handleInvalid="keep"
+            )
+        )
+        stages.append(
+            OneHotEncoder(
+                inputCol=idx_col,
+                outputCol=vec_col
+            )
+        )
+
+    pipe = Pipeline(stages=stages)
+    model = pipe.fit(df)
+    df = model.transform(df)
+
+    # is_S0_state
+    df = df.withColumn("is_S0_state", (F.col("conn_state") == "S0").cast("int"))
+
+    # suspicious_score = is_port_23*40 + is_S0_state*30 + is_port_22*25
+    df = df.withColumn(
+        "suspicious_score",
+        F.col("is_port_23") * F.lit(40) +
+        F.col("is_S0_state") * F.lit(30) +
+        F.col("is_port_22") * F.lit(25)
+    )
+
+    # DO NOT drop id.resp_p; graph builder needs it
+    return df
+
+
+# --------------------------------------------------------------------------------
+# FEATURE LIST
+# --------------------------------------------------------------------------------
+def build_and_save_feature_list(df):
+    print("📎 Building feature list...")
+
+    target_cols = {
+        Config.TARGET_COL,  # "label"
+        Config.DETAILED_TARGET_COL,  # "attack_type"
+        Config.FAMILY_TARGET_COL,  # "malware_family"
+        "attack_subtype"
     }
 
-    def parse_label(label_str):
-        label_str = re.sub(r'\(empty\)|-|\bmalicious\b|\bbenign\b', '', label_str).strip()
-        parsed = {'attack_type': set(), 'attack_subtype': set(), 'malware_family': set()}
-        for category, cat_patterns in patterns.items():
-            for key, pattern in cat_patterns.items():
-                if pattern.search(label_str): parsed[category].add(key)
+    id_like_cols = {
+        "device_ip",
+        "uid",
+        "Source_Folder",
+        "ts"
+    }
 
-        # ✅ FIX: Check if this is a malware family FIRST - they should NOT be attack types
-        primary_type = 'Unknown'
-        if parsed['malware_family']:
-            # If malware family detected, the attack_type should be "Malware", not the family name
-            primary_type = 'Malware'  # ← CHANGED: Use generic "Malware" instead of family name
-        elif 'PortScan' in parsed['attack_type']:
-            primary_type = 'PortScan'
-        elif 'C&C' in parsed['attack_type']:
-            primary_type = 'C&C'
-        elif 'DDoS' in parsed['attack_type']:
-            primary_type = 'DDoS'
-        elif 'FileDownload' in parsed['attack_type']:
-            primary_type = 'FileDownload'
-        elif 'Attack' in parsed['attack_type']:
-            primary_type = 'Attack'
+    feature_cols = [
+        c for c, t in df.dtypes
+        if c not in target_cols and c not in id_like_cols
+    ]
 
-        subtype = ','.join(sorted(list(parsed['attack_subtype']))) if parsed['attack_subtype'] else pd.NA
-        family = list(parsed['malware_family'])[0] if parsed['malware_family'] else pd.NA
-        if primary_type == 'Unknown' and label_str: primary_type = label_str.replace(' ', '').title()
-        return primary_type, subtype, family
-
-    parsed_results = malicious_labels.apply(parse_label)
-    df.loc[malicious_mask, 'attack_type'] = [res[0] for res in parsed_results]
-    df.loc[malicious_mask, 'attack_subtype'] = [res[1] for res in parsed_results]
-    df.loc[malicious_mask, 'malware_family'] = [res[2] for res in parsed_results]
-    if 'detailed-label' in df.columns: df = df.drop(columns=['detailed-label'], errors='ignore')
-    return df
+    joblib.dump(feature_cols, Config.FEATURE_LIST_PATH)
+    print(f"✓ Saved {len(feature_cols)} features to {Config.FEATURE_LIST_PATH}")
 
 
-def _preprocess_partition(df, all_categorical_values):
-    """Fully robust preprocessing function that handles inconsistent columns and dirty data."""
-
-    rename_dict = {'id.orig_h': 'id_orig_h', 'id.orig_p': 'id_orig_p', 'id.resp_h': 'id_resp_h',
-                   'id.resp_p': 'id_resp_p'}
-    df = df.rename(columns=rename_dict)
-
-    # ===== CRITICAL: FORCE CORRECT DATA TYPES FOR ALL COLUMNS =====
-
-    # 1. String columns (IPs, UIDs, etc.)
-    string_cols = ['uid', 'id_orig_h', 'id_resp_h', 'proto', 'service', 'conn_state',
-                   'history', 'Source_Folder', 'label', 'detailed-label']
-    for col in string_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).replace(['nan', 'None', '<NA>'], '')
-
-    # 2. Boolean/categorical columns that should be strings
-    bool_cols = ['local_orig', 'local_resp']
-    for col in bool_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).replace(['nan', 'None', '<NA>'], '')
-
-    # 3. Port columns (force to int)
-    if 'id_orig_p' in df.columns:
-        df['id_orig_p'] = pd.to_numeric(df['id_orig_p'], errors='coerce').fillna(0).astype(int)
-    if 'id_resp_p' in df.columns:
-        df['id_resp_p'] = pd.to_numeric(df['id_resp_p'], errors='coerce').fillna(0).astype(int)
-
-    # 4. IP addresses (force to clean strings)
-    if 'id_orig_h' in df.columns:
-        df['id_orig_h'] = df['id_orig_h'].fillna('0.0.0.0').astype(str).str.strip()
-    if 'id_resp_h' in df.columns:
-        df['id_resp_h'] = df['id_resp_h'].fillna('0.0.0.0').astype(str).str.strip()
-
-    # 5. Timestamp (force to numeric)
-    if 'ts' in df.columns:
-        df['ts'] = pd.to_numeric(df['ts'], errors='coerce').fillna(0)
-
-    # Now proceed with label cleaning
-    if 'label' in df.columns:
-        df = _clean_and_expand_labels(df)
-
-    # Process numeric columns
-    numeric_cols_to_process = set(Config.BASE_NUMERICAL_FEATURES + Config.SKEWED_NUMERICAL_FEATURES)
-    for col in numeric_cols_to_process:
-        if col in df.columns:
-            df[f'{col}_was_missing'] = pd.to_numeric(df[col], errors='coerce').isnull().astype(np.int8)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).clip(lower=0)
-            if col in Config.SKEWED_NUMERICAL_FEATURES:
-                df[col] = np.log1p(df[col])
-        else:
-            df[col] = 0
-            df[f'{col}_was_missing'] = 1
-
-    for col in Config.CATEGORICAL_LABEL_ENCODE:
-        if col in df.columns:
-            df[col] = df[col].fillna('unknown').astype(str).replace(['', '-', 'nan', 'None'], 'unknown')
-            df[col] = pd.Categorical(df[col]).codes.astype(np.int32)
-        else:
-            df[col] = 0
-
-    for col in Config.CATEGORICAL_ONE_HOT_ENCODE:
-        if col in df.columns:
-            df[col] = df[col].fillna('unknown').astype(str).replace(['', '-', 'nan', 'None'], 'unknown')
-            for category in all_categorical_values.get(col, []):
-                df[f'{col}_{category}'] = (df[col] == category).astype(np.int8)
-
-    df['is_port_23'] = (df.get('id_resp_p', 0) == 23).astype(np.int8)
-    df['is_port_22'] = (df.get('id_resp_p', 0) == 22).astype(np.int8)
-    df['is_S0_state'] = df.get('conn_state_S0', 0)
-
-    total_bytes = df.get('orig_bytes', 0) + df.get('resp_bytes', 0)
-    total_packets = df.get('orig_pkts', 0) + df.get('resp_pkts', 0)
-    df['upload_ratio'] = df.get('orig_bytes', 0) / (total_bytes + 1e-9)
-    df['bytes_per_packet'] = total_bytes / (total_packets + 1e-9)
-
-    safe_duration = np.expm1(df.get('duration', 0)).clip(lower=0.001)
-    df['packet_rate'] = (total_packets / safe_duration).clip(upper=10000)
-    df['is_scanning_signature'] = ((df['is_port_23'] == 1) & (df['is_S0_state'] == 1)).astype(np.int8)
-    df['suspicious_score'] = df['is_port_23'] * 40 + df['is_S0_state'] * 30 + df['is_port_22'] * 25
-
-    if 'id_resp_h' in df.columns:
-        resp_ip_features = extract_ip_features(df['id_resp_h'])
-        resp_ip_features.columns = ['resp_' + c for c in resp_ip_features.columns]
-        df = pd.concat([df, resp_ip_features], axis=1)
-
-    if 'id_orig_h' in df.columns:
-        orig_ip_features = extract_ip_features(df['id_orig_h'])
-        orig_ip_features.columns = ['orig_' + c for c in orig_ip_features.columns]
-        df = pd.concat([df, orig_ip_features], axis=1)
-
-    # ✅ FIX: Drop original categorical columns after one-hot encoding
-    columns_to_drop = ['uid', 'conn_state', 'proto', 'local_orig', 'local_resp']
-    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
-
-    return df
-
-def process_csv_with_chunked_pandas(file_path, file_key, all_categorical_values):
-    """Reads a CSV in chunks, processes each chunk, and saves the result as a Parquet file."""
-    output_path = os.path.join(Config.ENGINEERED_SPLIT_DIR, f"{file_key}.parquet")
-    chunks_list = []
-
-    try:
-        for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE, low_memory=False, on_bad_lines='skip', comment='#'):
-            chunk['Source_Folder'] = file_key
-            processed = _preprocess_partition(chunk, all_categorical_values)
-
-            ground_truth_family = Config.FILENAME_TO_FAMILY_MAP.get(file_key, 'Unknown')
-            if 'malware_family' not in processed.columns:
-                processed['malware_family'] = ground_truth_family  # Use ground truth directly
-            processed['malware_family'] = processed['malware_family'].fillna(ground_truth_family)
-
-            # Should be (delete lines 222 and 224):
-            # Only apply ground truth if the file is ACTUALLY benign AND labels are truly missing
-            if ground_truth_family == 'Benign':
-                # Only set label if it's NULL or Unknown - don't override parsed values
-                if 'label' in processed.columns:
-                    processed.loc[processed['label'].isin(['Unknown', None, '']), 'label'] = 'Benign'
-                else:
-                    processed['label'] = 'Benign'
-
-                # Same for attack_type
-                if 'attack_type' in processed.columns:
-                    processed.loc[processed['attack_type'].isin(['Unknown', None, '']), 'attack_type'] = 'Benign'
-                else:
-                    processed['attack_type'] = 'Benign'
-
-            chunks_list.append(processed)
-
-        if chunks_list:
-            final_df = pd.concat(chunks_list, ignore_index=True)
-            final_df.to_parquet(output_path, engine='pyarrow', compression='snappy', index=False)
-            tqdm.write(f"    ✅ Processed {os.path.basename(file_path)}: {len(final_df):,} rows")
-            return len(final_df)
-    except Exception as e:
-        tqdm.write(f"    ❌ FAILED to process {os.path.basename(file_path)}: {e}")
-        return 0
-    return 0
-
-
-def build_engineered_dataset():
-    """Builds the final dataset from all raw CSVs."""
-
-    if os.path.exists(Config.ENGINEERED_SPLIT_DIR):
-        print(f"🗑️  Removing old intermediate directory: {Config.ENGINEERED_SPLIT_DIR}")
-        shutil.rmtree(Config.ENGINEERED_SPLIT_DIR)
-    os.makedirs(Config.ENGINEERED_SPLIT_DIR)
-
+# --------------------------------------------------------------------------------
+# MAIN ENTRYPOINT
+# --------------------------------------------------------------------------------
+def build_engineered_dataset_spark(spark):
     print("\n" + "=" * 70)
-    print("🚀 STARTING DATASET BUILD PIPELINE (Pandas)")
+    print("🚀 PYSPARK FEATURE ENGINEERING PIPELINE")
+    print("=" * 70)
+    print(f"Mode: {'TEST' if Config.TEST_MODE else 'PRODUCTION'}")
+    print(f"Input dir: {Config.RAW_DIR_ORIGINAL}")
+    print(f"Output parquet: {Config.ENGINEERED_DATA_PATH}")
     print("=" * 70)
 
-    csv_files = glob.glob(os.path.join(Config.RAW_DIR_ORIGINAL, '*.csv'))
-    if not csv_files:
-        print(f"❌ Error: No CSV files found in '{Config.RAW_DIR_ORIGINAL}'")
+    # ensure output dirs exist
+    Config.ensure_output_dirs()
+
+    # 1. Load raw
+    df = load_raw_flows(spark)
+    raw_count = df.count()
+    print(f"✓ Loaded {raw_count:,} raw rows")
+    if raw_count == 0:
+        print("❌ No data found. Aborting feature engineering.")
         return
 
-    all_categorical_values = scan_categorical_values(csv_files)
+    # 2. Parse/align labels, families, attack types
+    df = clean_and_expand_labels(df)
 
-    print("\n" + "=" * 70)
-    print("🔍 PROCESSING RAW FILES (PARALLEL)")
+    # 3. Drop rows where label is NULL (unlabeled junk)
+    print("🧹 Filtering out rows with NULL labels...")
+    rows_before = df.count()
+    df = df.filter(F.col("label").isNotNull())
+    rows_after = df.count()
+    rows_dropped = rows_before - rows_after
+    print(f"✓ Dropped {rows_dropped:,} rows with NULL labels (kept {rows_after:,})")
+
+    # 4. Numeric cleanup
+    df = engineer_numeric_features(df)
+
+    # 5. IP features (+ device_ip)
+    df = extract_ip_features(df)
+
+    # 6. Behavioral/custom features
+    df = engineer_custom_features(df)
+
+    # 7. Categorical encoding
+    df = engineer_categorical_features(df)
+
+    # Cache for safety
+    df = df.cache()
+    final_rows = df.count()
+    print(f"✓ Engineered rows: {final_rows:,}")
+
+    # 8. Save feature list
+    build_and_save_feature_list(df)
+
+    # 9. Write final parquet
+    print("\n💾 Saving engineered dataset...")
+    (
+        df.write
+        .mode("overwrite")
+        .parquet(Config.ENGINEERED_DATA_PATH, compression="snappy")
+    )
+    print(f"✓ Saved to {Config.ENGINEERED_DATA_PATH}")
+
+    print("\n✅ FEATURE ENGINEERING COMPLETE!")
     print("=" * 70)
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        args_list = [(fp, all_categorical_values) for fp in csv_files]
-        list(tqdm(executor.map(process_single_csv, args_list), total=len(args_list), desc="Processing files"))
-
-    print("\n" + "=" * 70)
-    print("🔍 COMBINING PROCESSED FILES")
-    print("=" * 70)
-
-    split_files = glob.glob(os.path.join(Config.ENGINEERED_SPLIT_DIR, '*.parquet'))
-    if not split_files:
-        print("❌ No processed files found to combine.")
-        return
-
-    all_samples = [pd.read_parquet(f) for f in tqdm(split_files, desc="Loading processed files")]
-    final_df = pd.concat(all_samples, ignore_index=True)
-    print(f"✓ Final dataset created with {len(final_df):,} rows.")
-
-    print("\n⏳ Building and saving final feature list...")
-    target_cols = [Config.TARGET_COL, Config.DETAILED_TARGET_COL, Config.FAMILY_TARGET_COL, 'attack_subtype']
-    metadata_cols = ['id_orig_h', 'id_orig_p', 'id_resp_h', 'id_resp_p', 'Source_Folder']
-
-    for col in metadata_cols + target_cols:
-        if col not in final_df.columns:
-            final_df[col] = None
-
-    final_feature_list = [col for col in final_df.columns if col not in metadata_cols + target_cols]
-    final_column_order = metadata_cols + final_feature_list + target_cols
-    final_df = final_df.reindex(columns=final_column_order)
-
-    joblib.dump(final_feature_list, Config.FEATURE_LIST_PATH)
-    print(f"✓ Feature list saved with {len(final_feature_list)} features.")
-
-    print("\n⏳ Saving final Parquet file...")
-    final_df.to_parquet(Config.ENGINEERED_DATA_PATH, compression='snappy', index=False)
-    print(f"✓ Parquet saved to {Config.ENGINEERED_DATA_PATH}")
-
-    print("\n🗑️  Cleaning up intermediate files...")
-    shutil.rmtree(Config.ENGINEERED_SPLIT_DIR)
-    print(f"✅ Removed intermediate directory.")
-    print("=" * 70)
+    return df
 
 
 if __name__ == "__main__":
-    build_engineered_dataset()
+    spark = Config.get_spark_session("Stage2-FeatureEngineering")
+    build_engineered_dataset_spark(spark)
+    spark.stop()

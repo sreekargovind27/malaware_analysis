@@ -1,0 +1,6 @@
+time="2025-10-30T21:45:13-04:00" level=warning msg="Found orphan containers ([dic_phase2-stage1-analysis-run-6663f56c3d87 dic_phase2-stage1-analysis-run-9f5b2eb17d57 dic_phase2-stage1-analysis-run-ca67ddb5e310]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+ Container iot23-stage1  Created
+Attaching to iot23-stage1
+iot23-stage1  | Setting default log level to "WARN".
+iot23-stage1  | To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+iot23-stage1  | 25/10/31 01:45:17 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable

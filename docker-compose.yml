@@ -1,17 +1,38 @@
+version: "3.9"
+
 services:
-  stage1-analysis:
+  full_pipeline:
     build: .
-    container_name: iot23-stage1
+    container_name: iot23-full
     volumes:
       - ./data:/app/data
-      - ./outputs:/app/outputs                        # ✅ CHANGED: Single outputs folder
+      - ./outputs:/app/outputs
       - ./analysis:/app/analysis
-      - ./models:/app/models                           # ✅ ADDED: Mount models code
-      - ./scripts:/app/scripts                         # ✅ ADDED: Mount scripts
+      - ./models:/app/models
+      - ./scripts:/app/scripts
       - ./config.py:/app/config.py
     environment:
       - PYSPARK_PYTHON=python3
       - PYSPARK_DRIVER_PYTHON=python3
-      - SPARK_DRIVER_MEMORY=4g
-      - SPARK_EXECUTOR_MEMORY=4g
-    command: sh -c "python analysis/stage1/run_stage1.py && python analysis/stage2/run_stage2.py"
+      - SPARK_DRIVER_MEMORY=8g
+      - SPARK_EXECUTOR_MEMORY=8g
+      - DATA_SAMPLE_FRACTION=1.0
+    command: sh -c "python3 analysis/stage1/run_stage1.py && python3 analysis/stage2/run_stage2.py"
+
+  stage2_only:
+    build: .
+    container_name: iot23-stage2
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./analysis:/app/analysis
+      - ./models:/app/models
+      - ./scripts:/app/scripts
+      - ./config.py:/app/config.py
+    environment:
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+      - SPARK_DRIVER_MEMORY=8g
+      - SPARK_EXECUTOR_MEMORY=8g
+      - DATA_SAMPLE_FRACTION=1.0
+    command: python3 analysis/stage2/run_stage2.py

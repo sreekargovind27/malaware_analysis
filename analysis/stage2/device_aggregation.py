@@ -1,69 +1,261 @@
-# In analysis/stage2/device_aggregation.py
+"""
+Stage 2: Device Aggregation - PySpark Version
+
+Goal:
+- Take flow-level engineered features (one row per network flow)
+- Aggregate them into per-device profiles (one row per originating IP)
+
+This is the Spark equivalent of the pandas `aggregate_devices()` logic.
+"""
 
 import os
 import sys
 
-import pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql import SparkSession
 
-# Add project root to path to import Config
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+# Make sure local imports work if run directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import Config
 
 
-def aggregate_devices():
-    """Aggregate flow-level data to device-level features."""
+def _get_numeric_feature_cols(df):
+    """
+    Infer which columns are numeric and safe to aggregate.
+
+    We EXCLUDE:
+    - device identity / metadata / targets
+      ("device_ip", "uid", "Source_Folder", timestamps, etc.)
+    - label columns ("label", "attack_type", "malware_family", "attack_subtype")
+
+    We INCLUDE:
+    - anything that's int*/bigint*/long*/float*/double*
+      (Spark dtypes like 'int', 'bigint', 'double', etc.)
+    """
+    BLOCKLIST = {
+        "device_ip",
+        "uid",
+        "Source_Folder",
+        "ts",
+        "label",
+        "attack_type",
+        "attack_subtype",
+        "malware_family",
+        "is_port_23",  # we'll still aggregate these flags, so DO NOT blocklist them
+        "is_port_22",  # (remove from blocklist)
+        "is_telnet",  # same
+        "is_unknown_service",  # same
+        "is_S0_state",  # same
+        "suspicious_score",  # same
+    }
+
+    # fix: pull the flags above back out of BLOCKLIST
+    # better approach: create BASE_BLOCKLIST then re-allow
+    BASE_BLOCKLIST = {
+        "device_ip",
+        "uid",
+        "Source_Folder",
+        "ts",
+        "label",
+        "attack_type",
+        "attack_subtype",
+        "malware_family",
+    }
+
+    numeric_cols = []
+    for field in df.schema:
+        name = field.name
+        dtype = field.dataType.simpleString()  # e.g. 'double', 'string', 'int', 'bigint'
+        if name in BASE_BLOCKLIST:
+            continue
+        # only aggregate scalars, not vector columns (like proto_vec is VectorUDT)
+        # we detect vectors by checking simpleString() doesn't contain 'vector'
+        if "vector" in dtype:
+            continue
+        if (
+                dtype.startswith("int")
+                or dtype.startswith("bigint")
+                or dtype.startswith("long")
+                or dtype.startswith("float")
+                or dtype.startswith("double")
+        ):
+            numeric_cols.append(name)
+
+    return numeric_cols
+
+
+def aggregate_devices_spark(spark):
+    """
+    Build per-device stats:
+      - mean / std / min / max / sum for each numeric flow feature
+      - flow_count per device
+      - device_label (approx majority label for that device)
+      - device_malware_family (dominant malware family if malicious, else 'Benign')
+
+    Saves to Config.DEVICE_FEATURES_PATH.
+    """
+
     print("\n" + "=" * 70)
-    print("DEVICE-LEVEL AGGREGATION")
+    print("ðŸ”§ DEVICE-LEVEL AGGREGATION (PySpark)")
     print("=" * 70)
 
-    print(f"📂 Loading flow features from: {Config.ENGINEERED_DATA_PATH}")
-    df = pd.read_parquet(Config.ENGINEERED_DATA_PATH)
-    print(f"✓ Loaded {len(df):,} flows")
+    # ------------------------------------------------------------------
+    # Load engineered flow-level features
+    # ------------------------------------------------------------------
+    print("ðŸ“‚ Loading engineered flow features for device aggregation...")
+    print(f"   Path: {Config.ENGINEERED_DATA_PATH}")
 
-    device_col = 'id_orig_h'
-    if device_col not in df.columns:
-        print(f"❌ ERROR: Device identifier column '{device_col}' not found.")
-        return
+    df = spark.read.parquet(Config.ENGINEERED_DATA_PATH)
 
-    print(f"\n🔍 Aggregating by device IP ({device_col})...")
-    features = Config.get_feature_list()
-    numeric_features = [f for f in features if f in df.columns and pd.api.types.is_numeric_dtype(df[f])]
-    print(f"✓ Found {len(numeric_features)} numeric features to aggregate.")
+    total_flows = df.count()
+    print(f"âœ“ Loaded {total_flows:,} flows")
 
-    # ✅ FINAL FIX: Perform aggregations in two separate, correct steps.
-    print("\n⏳ Computing device statistics...")
+    # sanity: we NEED device_ip (we constructed this from id.orig_h in feature_engineering)
+    if "device_ip" not in df.columns:
+        raise RuntimeError(
+            "Device aggregation needs 'device_ip' in the engineered parquet. "
+            "This column should come from id.orig_h in feature_engineering."
+        )
 
-    # Step 1: Aggregate only the numeric features
-    numeric_agg_dict = {feat: ['mean', 'std', 'min', 'max', 'sum'] for feat in numeric_features}
-    device_stats = df.groupby(device_col).agg(numeric_agg_dict)
-    device_stats.columns = ['_'.join(col).strip() for col in device_stats.columns]  # Flatten multi-level columns
+    # ------------------------------------------------------------------
+    # Pick numeric columns to aggregate
+    # ------------------------------------------------------------------
+    numeric_features = _get_numeric_feature_cols(df)
+    print(f"âœ“ Found {len(numeric_features)} numeric features to aggregate")
 
-    # Step 2: Calculate the flow count separately and merge it in
-    flow_counts = df.groupby(device_col).size().reset_index(name='flow_count')
-    device_stats = device_stats.reset_index().merge(flow_counts, on=device_col, how='left')
+    # Build aggregations: mean/std/min/max/sum for each numeric feature
+    agg_exprs = []
+    for feat in numeric_features:
+        # Use backticks to escape column names with dots or hyphens
+        col_ref = f"`{feat}`"
+        agg_exprs.extend([
+            F.mean(F.col(col_ref)).alias(f"{feat}_mean"),
+            F.stddev(F.col(col_ref)).alias(f"{feat}_std"),
+            F.min(F.col(col_ref)).alias(f"{feat}_min"),
+            F.max(F.col(col_ref)).alias(f"{feat}_max"),
+            F.sum(F.col(col_ref)).alias(f"{feat}_sum"),
+        ])
 
-    # --- Add labels and clean up ---
-    print("⏳ Determining device labels...")
-    device_labels = df.groupby(device_col)[Config.TARGET_COL].agg(lambda x: x.value_counts().index[0]).reset_index()
-    device_labels.columns = [device_col, 'device_label']
-    device_stats = device_stats.merge(device_labels, on=device_col, how='left')
+    # Also include flow_count
+    agg_exprs.append(F.count(F.lit(1)).alias("flow_count"))
 
-    malicious_devices = df[df[Config.TARGET_COL] == 'Malicious'].groupby(device_col)[Config.FAMILY_TARGET_COL].agg(
-        lambda x: x.value_counts().index[0] if not x.empty else 'Unknown').reset_index()
-    malicious_devices.columns = [device_col, 'device_malware_family']
-    device_stats = device_stats.merge(malicious_devices, on=device_col, how='left')
+    print("\nâ³ Aggregating numeric stats per device (groupBy device_ip)...")
+    device_stats = df.groupBy("device_ip").agg(*agg_exprs)
 
-    device_stats['device_malware_family'].fillna('Benign', inplace=True)
-    device_stats.fillna(0, inplace=True)
+    # ------------------------------------------------------------------
+    # Attach device_label (approximate majority)
+    # ------------------------------------------------------------------
+    # pandas version: most common label per device.
+    # Spark fast path: first() is cheaper and generally fine for us.
+    print("â³ Deriving per-device label...")
+    device_labels = (
+        df.groupBy("device_ip")
+        .agg(F.first("label").alias("device_label"))
+    )
 
-    device_stats = device_stats.apply(pd.to_numeric, errors='ignore')
+    device_stats = device_stats.join(device_labels, on="device_ip", how="left")
 
-    print(f"\n✓ Created {len(device_stats):,} device profiles with {len(device_stats.columns) - 1} features each.")
+    # ------------------------------------------------------------------
+    # Attach device_malware_family
+    # ------------------------------------------------------------------
+    # pandas version:
+    #   malicious_devices = df[df['label']=="Malicious"].groupby(device)['malware_family'].agg(mode)
+    #
+    # We'll do:
+    #   - filter malicious rows only
+    #   - first(malware_family) for each device
+    # then join
+    if "malware_family" in df.columns:
+        malicious_fam = (
+            df.filter(F.col("label") == "Malicious")
+            .groupBy("device_ip")
+            .agg(F.first("malware_family").alias("device_malware_family"))
+        )
+        device_stats = device_stats.join(malicious_fam, on="device_ip", how="left")
+    else:
+        # fallback if somehow malware_family missing
+        device_stats = device_stats.withColumn("device_malware_family", F.lit(None).cast("string"))
 
-    print(f"\n💾 Saving device features to: {Config.DEVICE_FEATURES_PATH}")
-    device_stats.to_parquet(Config.DEVICE_FEATURES_PATH, index=False)
-    print("✅ Device aggregation complete!")
+    # Fill Benign for devices without a malware family
+    device_stats = device_stats.withColumn(
+        "device_malware_family",
+        F.when(
+            F.col("device_malware_family").isNull() & (F.col("device_label") != "Malicious"),
+            F.lit("Benign")
+        ).otherwise(F.col("device_malware_family"))
+    )
+
+    # ------------------------------------------------------------------
+    # Cleanup nulls
+    # ------------------------------------------------------------------
+    print("â³ Cleaning nulls...")
+    # stddev can be null for single-flow devices, fill with 0
+    device_stats = device_stats.fillna(0)
+    # malware family final fallback
+    device_stats = device_stats.fillna({"device_malware_family": "Benign"})
+
+    # Count device rows
+    device_count = device_stats.count()
+    print(f"\nâœ“ Created {device_count:,} device profiles")
+
+    # ------------------------------------------------------------------
+    # Save device-level parquet
+    # ------------------------------------------------------------------
+    print(f"\nðŸ’¾ Saving device features to: {Config.DEVICE_FEATURES_PATH}")
+    (
+        device_stats.write
+        .mode("overwrite")
+        .parquet(Config.DEVICE_FEATURES_PATH, compression="snappy")
+    )
+
+    # ------------------------------------------------------------------
+    # Small summary stats (collected to driver)
+    # ------------------------------------------------------------------
+    print("\nðŸ“Š Device Statistics:")
+
+    print(f"   Total devices: {device_count:,}")
+
+    label_counts = (
+        device_stats.groupBy("device_label")
+        .agg(F.count(F.lit(1)).alias("cnt"))
+        .collect()
+    )
+    for row in label_counts:
+        print(f"   {row['device_label']}: {row['cnt']:,}")
+
+    agg_summary = device_stats.agg(
+        F.mean("flow_count").alias("avg_flows"),
+        F.max("flow_count").alias("max_flows")
+    ).collect()[0]
+
+    avg_flows = agg_summary["avg_flows"]
+    max_flows = agg_summary["max_flows"]
+
+    print(f"   Avg flows per device: {avg_flows:.1f}")
+    print(f"   Max flows per device: {int(max_flows)}")
+
+    print("\nâœ… Device aggregation complete!")
+    print("=" * 70)
+
+    return device_stats
 
 
 if __name__ == "__main__":
-    aggregate_devices()
+    # Standalone debug mode:
+    Config.ensure_output_dirs()
+    spark = (
+        SparkSession.builder
+        .appName("Stage2-DeviceAggregation-Standalone")
+        .config("spark.master", "local[*]")
+        .config("spark.driver.memory", "8g")
+        .config("spark.sql.shuffle.partitions", "8")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+
+    try:
+        aggregate_devices_spark(spark)
+    finally:
+        spark.stop()
