@@ -2,6 +2,8 @@
 Provides data loading and preparation functions for model training.
 Classification loaders read from pre-split master datasets to ensure reproducibility,
 while unsupervised loaders use the full dataset.
+
+FIXED VERSION - Properly handles non-numeric columns
 """
 import os
 
@@ -22,6 +24,7 @@ from config import Config
 
 class IoTDataset(Dataset):
     """A PyTorch Dataset for the IoT traffic data."""
+
     def __init__(self, X, y=None):
         if isinstance(X, pd.DataFrame):
             X = X.values
@@ -88,10 +91,24 @@ def get_data_for_autoencoder():
     benign_df = df.loc[df[Config.TARGET_COL] == 'Benign', features]
     print(f"✓ Filtered to {len(benign_df):,} benign samples")
 
-    # 3. Drop constant columns
+    # 3. Drop constant columns (FIXED: only consider numeric columns)
     print(f"\n⏳ Removing constant columns...")
-    non_constant_cols = benign_df.columns[benign_df.std() > 1e-6].tolist()
+
+    # CRITICAL FIX: Select only numeric columns before computing std()
+    numeric_cols = benign_df.select_dtypes(include=[np.number]).columns.tolist()
+
+    if len(numeric_cols) < len(benign_df.columns):
+        non_numeric = set(benign_df.columns) - set(numeric_cols)
+        print(f"⚠️  Warning: Dropping {len(non_numeric)} non-numeric columns: {non_numeric}")
+
+    # Compute std only on numeric columns
+    non_constant_cols = [col for col in numeric_cols if benign_df[col].std() > 1e-6]
+
+    print(f"✓ Kept {len(non_constant_cols)} non-constant numeric features out of {len(numeric_cols)} numeric features")
+
+    # Save the feature list
     joblib.dump(non_constant_cols, Config.AUTOENCODER_FEATURE_LIST_PATH)
+    print(f"✓ Saved feature list to: {Config.AUTOENCODER_FEATURE_LIST_PATH}")
 
     X = benign_df[non_constant_cols].fillna(0)
 
@@ -107,7 +124,7 @@ def get_data_for_autoencoder():
     from sklearn.ensemble import IsolationForest
     iso = IsolationForest(
         n_estimators=100,
-        contamination=0.05,   # assume ~5% of your 'benign' is actually noisy/weird
+        contamination=0.05,  # assume ~5% of your 'benign' is actually noisy/weird
         random_state=42
     )
     inlier_mask = iso.fit_predict(X_scaled)  # 1 = inlier, -1 = outlier
@@ -143,6 +160,10 @@ def get_data_for_autoencoder():
     )
 
     print(f"✓ Autoencoder data ready.")
+    print(f"   Train samples: {len(X_train):,}")
+    print(f"   Val samples: {len(X_val):,}")
+    print(f"   Features: {len(non_constant_cols)}")
+
     return train_loader, val_loader, scaler, non_constant_cols
 
 
@@ -213,14 +234,28 @@ def get_data_for_multiclass():
     print(f"✓ Final training set size: {len(df_train_final):,}")
 
     le = LabelEncoder()
-    X_train = df_train_final[features]
+
+    # 1) Build full feature frames
+    X_train_full = df_train_final[features]
     y_train = le.fit_transform(df_train_final[Config.DETAILED_TARGET_COL])
 
     # Filter the test set to only include classes present in the final training set.
-    test_classes_seen_in_train = [cls for cls in test_df[Config.DETAILED_TARGET_COL].unique() if cls in le.classes_]
+    test_classes_seen_in_train = [
+        cls for cls in test_df[Config.DETAILED_TARGET_COL].unique()
+        if cls in le.classes_
+    ]
     test_df_filtered = test_df[test_df[Config.DETAILED_TARGET_COL].isin(test_classes_seen_in_train)]
-    X_test = test_df_filtered[features]
+    X_test_full = test_df_filtered[features]
     y_test = le.transform(test_df_filtered[Config.DETAILED_TARGET_COL])
+
+    # 2) Keep ONLY numeric columns (drop IPs, timestamps, etc.)
+    numeric_cols = X_train_full.select_dtypes(include=["number"]).columns
+    dropped = set(X_train_full.columns) - set(numeric_cols)
+    if dropped:
+        print(f"⚠️ Dropping non-numeric columns for multiclass: {dropped}")
+
+    X_train = X_train_full[numeric_cols]
+    X_test = X_test_full[numeric_cols]
 
     encoder_path = os.path.join(Config.SPLITS_DIR, 'multiclass_label_encoder.joblib')
     joblib.dump(le, encoder_path)

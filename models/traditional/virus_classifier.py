@@ -281,7 +281,7 @@ class VirusClassifier:
 
 if __name__ == "__main__":
     Config.set_seeds()
-    Config.ensure_output_dirs()  # ✅ ADD THIS LINE
+    Config.ensure_output_dirs()
     Config.print_mode_info()
 
     print("=" * 70)
@@ -290,25 +290,45 @@ if __name__ == "__main__":
     overall_start = time.time()
     try:
         X_train, X_test, y_train, y_test, label_encoder = get_data_for_virus()
+
+        # 🔧 NEW: keep only numeric/boolean columns
+        numeric_cols = X_train.select_dtypes(include=["number", "bool"]).columns
+        non_numeric = set(X_train.columns) - set(numeric_cols)
+        if non_numeric:
+            print(f"⚠️ Dropping non-numeric columns for virus classifier: {non_numeric}")
+
+        X_train = X_train[numeric_cols]
+        X_test = X_test[numeric_cols]
+
         if len(X_train) < 2 or len(np.unique(y_train)) < 2:
             print("\n⚠️  Not enough data or class diversity to train virus classifier. Skipping.")
         else:
             print("\n⏳ Creating validation split...")
             try:
-                X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2,
-                                                            random_state=Config.RANDOM_STATE, stratify=y_train)
+                X_tr, X_val, y_tr, y_val = train_test_split(
+                    X_train, y_train,
+                    test_size=0.2,
+                    random_state=Config.RANDOM_STATE,
+                    stratify=y_train
+                )
                 print(f"✓ Split complete (stratified)")
             except ValueError:
                 print("   ⚠️  Could not stratify. Using random split.")
-                X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2,
-                                                            random_state=Config.RANDOM_STATE)
+                X_tr, X_val, y_tr, y_val = train_test_split(
+                    X_train, y_train,
+                    test_size=0.2,
+                    random_state=Config.RANDOM_STATE
+                )
                 print(f"✓ Split complete (random)")
+
             print(f"   Train: {len(X_tr):,}\n   Val:   {len(X_val):,}\n   Test:  {len(X_test):,}")
+
             classifier = VirusClassifier()
             classifier.train(X_tr, y_tr, X_val, y_val, use_smote=True, use_optuna=True)
             classifier.evaluate(X_test, y_test, label_encoder)
             classifier.analyze_families(X_test, y_test, label_encoder)
             classifier.save_model()
+
             total_time = time.time() - overall_start
             print("\n" + "=" * 70)
             print("🎉 VIRUS CLASSIFIER COMPLETE")

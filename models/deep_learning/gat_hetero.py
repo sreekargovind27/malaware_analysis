@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, roc_auc_score, balanced_accuracy_score
 from torch_geometric.nn import HeteroConv, GATConv, Linear, BatchNorm
 from tqdm import tqdm
+from torch.nn.parameter import UninitializedParameter
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from config import Config
@@ -452,7 +453,12 @@ if __name__ == "__main__":
         data = data.cpu()  # Move back to CPU
 
     print(f"✅ Model initialized")
-    print(f"📊 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    total_params = sum(
+        p.numel()
+        for p in model.parameters()
+        if not isinstance(p, UninitializedParameter)
+    )
+    print(f"📊 Model parameters (initialized only): {total_params:,}")
 
     # Train
     model = train_model(model, data, Config.DEVICE, epochs=100)

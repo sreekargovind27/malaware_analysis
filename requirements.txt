@@ -20,3 +20,10 @@ torch-geometric==2.3.1
 tqdm==4.66.1
 matplotlib==3.7.2
 seaborn==0.12.2
+
+fastmcp
+google-genai
+python-dotenv
+uv
+streamlit
+google-generativeai

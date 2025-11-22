@@ -329,13 +329,17 @@ class MultiClassNeuralNetModel:
         if not Config.USE_OPTUNA:
             self.best_params = {
                 'n_layers': 3, 'layer_1': 128, 'layer_2': 64, 'layer_3': 32,
-                'dropout_rate': 0.3, 'learning_rate': 0.001, 'batch_size': 4096, 'use_batch_norm': True
+                'dropout_rate': 0.3, 'learning_rate': 0.001, 'batch_size': 512, 'use_batch_norm': True
             }
             return self.best_params
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
+
+        # 🔧 Make sure there are no NaNs / infs
+        X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
         def objective(trial):
             print(f"\n--- Starting Optuna Trial #{trial.number} ---")
@@ -344,7 +348,7 @@ class MultiClassNeuralNetModel:
             dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
             use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
             learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-            batch_size = trial.suggest_categorical('batch_size', [4096, 8192, 16384])
+            batch_size = trial.suggest_categorical('batch_size', [256, 512, 1024])
             print(f"  > Params: Layers={hidden_layers}, Batch={batch_size}, LR={learning_rate:.5f}")
 
             num_classes_for_trial = len(np.unique(y_train))
@@ -382,7 +386,6 @@ class MultiClassNeuralNetModel:
                     best_val_acc = val_acc
 
             print(f"  > Trial #{trial.number} finished. Best Val Acc: {best_val_acc:.4f}")
-            torch.cuda.empty_cache()
             return best_val_acc
 
         study = optuna.create_study(direction='maximize')
@@ -406,7 +409,7 @@ class MultiClassNeuralNetModel:
             self.use_batch_norm = best_params['use_batch_norm']
             batch_size = best_params['batch_size']
         else:
-            batch_size = 4096
+            batch_size = 512
 
         self.build_model()
         class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
@@ -414,6 +417,10 @@ class MultiClassNeuralNetModel:
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_val_scaled = self.scaler.transform(X_val)
+
+        # 🔧 Make sure there are no NaNs / infs
+        X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
         train_loader = DataLoader(IoTDataset(X_train_scaled, y_train), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(IoTDataset(X_val_scaled, y_val), batch_size=batch_size, shuffle=False)
@@ -430,6 +437,7 @@ class MultiClassNeuralNetModel:
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
                 total_loss += loss.item()
 
@@ -464,6 +472,9 @@ class MultiClassNeuralNetModel:
         if hasattr(X, 'values'):
             X = X.values
         X_scaled = self.scaler.transform(X)
+        # 🔧 Clean any NaNs / infs in test features
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
         self.model.eval()
         with torch.no_grad():

@@ -7,7 +7,7 @@ shutil.rmtree(OUTPUT, ignore_errors=True)
 os.makedirs(OUTPUT)
 
 for root, dirs, files in os.walk("."):
-    dirs[:] = [d for d in dirs if d not in ["__pycache__", ".git", "venv", "node_modules"]]
+    dirs[:] = [d for d in dirs if d not in ["__pycache__", ".git", "venv", "venv3.10", "node_modules"]]
     for f in files:
         if f.endswith(".py"):
             src = Path(root) / f

@@ -227,12 +227,15 @@ class Config:
 
     RUN_LOGISTIC_REGRESSION = True
 
-    if torch.cuda.is_available():
-        DEVICE = "cuda"
-    elif torch.backends.mps.is_available():
-        DEVICE = "mps"
-    else:
-        DEVICE = "cpu"
+    # if torch.cuda.is_available():
+    #     DEVICE = "cuda"
+    # elif torch.backends.mps.is_available():
+    #     DEVICE = "mps"
+    # else:
+    #     DEVICE = "cpu"
+    #
+    # TODO - remove
+    DEVICE = "cpu"
 
     NOISE_START = 0.05
     NOISE_WARMUP_EPOCHS = 40

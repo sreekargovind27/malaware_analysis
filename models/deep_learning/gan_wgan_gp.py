@@ -29,6 +29,16 @@ from tqdm import tqdm
 from config import Config
 from models.data_loader import get_data_for_autoencoder
 
+# -------------------------------------------------
+# Fallback: WGAN-GP needs 2nd-order grads (gradient penalty),
+# which MPS can't do in torch==2.0.1. Run on CPU instead.
+# -------------------------------------------------
+if getattr(Config, "DEVICE", None) == "mps":
+    print("⚠ MPS can't handle 2nd-order grads for WGAN-GP. Falling back to CPU.")
+    Config.DEVICE = "cpu"
+
+
+# -------------------------------------------------
 
 # -------------------------
 # Load malicious samples for semi-supervised training
@@ -46,7 +56,7 @@ def get_malicious_samples(ratio=0.1):
     import pandas as pd
     import joblib
 
-    print(f"\n📊 Loading {ratio*100:.0f}% malicious samples for semi-supervised training...")
+    print(f"\n📊 Loading {ratio * 100:.0f}% malicious samples for semi-supervised training...")
 
     # Load full dataset
     df = pd.read_parquet(Config.ENGINEERED_DATA_PATH)
