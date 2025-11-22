@@ -10,8 +10,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY config.py .
+COPY run_full_pipeline.py .
 COPY analysis/ ./analysis/
-COPY models/ ./models/
 COPY scripts/ ./scripts/
 
 # Create directories
@@ -31,4 +31,4 @@ ENV PYTHONUNBUFFERED=1
 # We do NOT force stage2 here.
 # We leave entrypoint empty so docker-compose can decide what to run.
 ENTRYPOINT []
-CMD ["python3"]
+CMD ["python3", "run_full_pipeline.py"]

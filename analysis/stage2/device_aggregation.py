@@ -1,261 +1,289 @@
 """
-Stage 2: Device Aggregation - PySpark Version
+Stage 2: Device-Level Aggregation - PySpark Version
+Works on both local and Databricks with automatic optimization.
 
-Goal:
-- Take flow-level engineered features (one row per network flow)
-- Aggregate them into per-device profiles (one row per originating IP)
+Pipeline:
+1. Load engineered flow features
+2. Aggregate per device_ip (statistical features)
+3. Create device-level behavioral features
+4. Save device_features.parquet
 
-This is the Spark equivalent of the pandas `aggregate_devices()` logic.
+Optimizations:
+- Repartition by device_ip before groupBy (critical for 40GB data)
+- Smart persist for intermediate results
+- Optimized parquet writes
 """
 
 import os
 import sys
 
-from pyspark.sql import functions as F
-from pyspark.sql import SparkSession
-
-# Make sure local imports work if run directly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pyspark.sql import functions as F
+from pyspark.sql import Window
 
 from config import Config
+from analysis.stage2.utils import (
+    load_engineered_data_spark, smart_repartition, smart_persist,
+    write_parquet_optimized, print_environment_info, validate_dataframe
+)
 
 
-def _get_numeric_feature_cols(df):
-    """
-    Infer which columns are numeric and safe to aggregate.
-
-    We EXCLUDE:
-    - device identity / metadata / targets
-      ("device_ip", "uid", "Source_Folder", timestamps, etc.)
-    - label columns ("label", "attack_type", "malware_family", "attack_subtype")
-
-    We INCLUDE:
-    - anything that's int*/bigint*/long*/float*/double*
-      (Spark dtypes like 'int', 'bigint', 'double', etc.)
-    """
-    BLOCKLIST = {
-        "device_ip",
-        "uid",
-        "Source_Folder",
-        "ts",
-        "label",
-        "attack_type",
-        "attack_subtype",
-        "malware_family",
-        "is_port_23",  # we'll still aggregate these flags, so DO NOT blocklist them
-        "is_port_22",  # (remove from blocklist)
-        "is_telnet",  # same
-        "is_unknown_service",  # same
-        "is_S0_state",  # same
-        "suspicious_score",  # same
-    }
-
-    # fix: pull the flags above back out of BLOCKLIST
-    # better approach: create BASE_BLOCKLIST then re-allow
-    BASE_BLOCKLIST = {
-        "device_ip",
-        "uid",
-        "Source_Folder",
-        "ts",
-        "label",
-        "attack_type",
-        "attack_subtype",
-        "malware_family",
-    }
-
-    numeric_cols = []
-    for field in df.schema:
-        name = field.name
-        dtype = field.dataType.simpleString()  # e.g. 'double', 'string', 'int', 'bigint'
-        if name in BASE_BLOCKLIST:
-            continue
-        # only aggregate scalars, not vector columns (like proto_vec is VectorUDT)
-        # we detect vectors by checking simpleString() doesn't contain 'vector'
-        if "vector" in dtype:
-            continue
-        if (
-                dtype.startswith("int")
-                or dtype.startswith("bigint")
-                or dtype.startswith("long")
-                or dtype.startswith("float")
-                or dtype.startswith("double")
-        ):
-            numeric_cols.append(name)
-
-    return numeric_cols
-
+# ============================================================================
+# DEVICE AGGREGATION
+# ============================================================================
 
 def aggregate_devices_spark(spark):
     """
-    Build per-device stats:
-      - mean / std / min / max / sum for each numeric flow feature
-      - flow_count per device
-      - device_label (approx majority label for that device)
-      - device_malware_family (dominant malware family if malicious, else 'Benign')
+    Aggregate flow-level features to device-level features.
 
-    Saves to Config.DEVICE_FEATURES_PATH.
+    Creates per-device statistics:
+    - Flow counts (total, benign, malicious)
+    - Duration statistics (mean, std, min, max)
+    - Byte statistics (orig_bytes, resp_bytes)
+    - Packet statistics (orig_pkts, resp_pkts)
+    - Behavioral ratios (avg upload ratio, packet rate)
+    - Port usage patterns
+    - Attack type distribution
+
+    Args:
+        spark: Active SparkSession
     """
-
     print("\n" + "=" * 70)
-    print("ðŸ”§ DEVICE-LEVEL AGGREGATION (PySpark)")
+    print("STAGE 2: DEVICE-LEVEL AGGREGATION")
     print("=" * 70)
 
-    # ------------------------------------------------------------------
-    # Load engineered flow-level features
-    # ------------------------------------------------------------------
-    print("ðŸ“‚ Loading engineered flow features for device aggregation...")
-    print(f"   Path: {Config.ENGINEERED_DATA_PATH}")
+    print_environment_info(spark)
 
-    df = spark.read.parquet(Config.ENGINEERED_DATA_PATH)
+    # ========================================
+    # 1. LOAD ENGINEERED DATA
+    # ========================================
 
-    total_flows = df.count()
-    print(f"âœ“ Loaded {total_flows:,} flows")
+    flows = load_engineered_data_spark(spark)
 
-    # sanity: we NEED device_ip (we constructed this from id.orig_h in feature_engineering)
-    if "device_ip" not in df.columns:
-        raise RuntimeError(
-            "Device aggregation needs 'device_ip' in the engineered parquet. "
-            "This column should come from id.orig_h in feature_engineering."
-        )
+    # Validate required columns exist
+    required_cols = ["device_ip", "label", "duration", "orig_bytes", "resp_bytes"]
+    missing_cols = [c for c in required_cols if c not in flows.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
 
-    # ------------------------------------------------------------------
-    # Pick numeric columns to aggregate
-    # ------------------------------------------------------------------
-    numeric_features = _get_numeric_feature_cols(df)
-    print(f"âœ“ Found {len(numeric_features)} numeric features to aggregate")
+    print(f"\n📊 Input: {flows.count():,} flows from {flows.select('device_ip').distinct().count():,} devices")
 
-    # Build aggregations: mean/std/min/max/sum for each numeric feature
+    # ========================================
+    # 2. REPARTITION BY DEVICE_IP (CRITICAL FOR PERFORMANCE)
+    # ========================================
+
+    print("\n🔄 Optimizing partitioning for aggregation...")
+
+    if Config.is_databricks():
+        # Repartition by device_ip to colocate same devices
+        # This prevents massive shuffles during groupBy
+        flows = smart_repartition(flows, partition_cols=["device_ip"])
+
+    # Persist to avoid re-reading from disk during multiple aggregations
+    flows = smart_persist(flows)
+
+    # ========================================
+    # 3. DEVICE-LEVEL AGGREGATIONS
+    # ========================================
+
+    print("\n🔢 Aggregating features per device...")
+
+    # Build aggregation expressions
     agg_exprs = []
-    for feat in numeric_features:
-        # Use backticks to escape column names with dots or hyphens
-        col_ref = f"`{feat}`"
+
+    # --- Flow Counts ---
+    agg_exprs.extend([
+        F.count("*").alias("total_flows"),
+        F.sum(F.when(F.col("label") == "Benign", 1).otherwise(0)).alias("benign_flows"),
+        F.sum(F.when(F.col("label") == "Malicious", 1).otherwise(0)).alias("malicious_flows"),
+    ])
+
+    # --- Duration Statistics ---
+    agg_exprs.extend([
+        F.mean("duration").alias("duration_mean"),
+        F.stddev("duration").alias("duration_std"),
+        F.min("duration").alias("duration_min"),
+        F.max("duration").alias("duration_max"),
+    ])
+
+    # --- Byte Statistics ---
+    for byte_col in ["orig_bytes", "resp_bytes"]:
         agg_exprs.extend([
-            F.mean(F.col(col_ref)).alias(f"{feat}_mean"),
-            F.stddev(F.col(col_ref)).alias(f"{feat}_std"),
-            F.min(F.col(col_ref)).alias(f"{feat}_min"),
-            F.max(F.col(col_ref)).alias(f"{feat}_max"),
-            F.sum(F.col(col_ref)).alias(f"{feat}_sum"),
+            F.mean(byte_col).alias(f"{byte_col}_mean"),
+            F.stddev(byte_col).alias(f"{byte_col}_std"),
+            F.sum(byte_col).alias(f"{byte_col}_total"),
+            F.max(byte_col).alias(f"{byte_col}_max"),
         ])
 
-    # Also include flow_count
-    agg_exprs.append(F.count(F.lit(1)).alias("flow_count"))
+    # --- Packet Statistics ---
+    for pkt_col in ["orig_pkts", "resp_pkts"]:
+        if pkt_col in flows.columns:
+            agg_exprs.extend([
+                F.mean(pkt_col).alias(f"{pkt_col}_mean"),
+                F.sum(pkt_col).alias(f"{pkt_col}_total"),
+            ])
 
-    print("\nâ³ Aggregating numeric stats per device (groupBy device_ip)...")
-    device_stats = df.groupBy("device_ip").agg(*agg_exprs)
+    # --- Behavioral Features ---
+    if "upload_ratio" in flows.columns:
+        agg_exprs.append(F.mean("upload_ratio").alias("upload_ratio_mean"))
 
-    # ------------------------------------------------------------------
-    # Attach device_label (approximate majority)
-    # ------------------------------------------------------------------
-    # pandas version: most common label per device.
-    # Spark fast path: first() is cheaper and generally fine for us.
-    print("â³ Deriving per-device label...")
-    device_labels = (
-        df.groupBy("device_ip")
-        .agg(F.first("label").alias("device_label"))
+    if "packet_rate" in flows.columns:
+        agg_exprs.append(F.mean("packet_rate").alias("packet_rate_mean"))
+
+    if "suspicious_score" in flows.columns:
+        agg_exprs.extend([
+            F.mean("suspicious_score").alias("suspicious_score_mean"),
+            F.max("suspicious_score").alias("suspicious_score_max"),
+        ])
+
+    # --- Port Usage Patterns ---
+    for port_flag in ["is_port_23", "is_port_22", "is_port_80", "is_port_443"]:
+        if port_flag in flows.columns:
+            agg_exprs.append(F.sum(port_flag).alias(f"{port_flag}_count"))
+
+    # --- Attack Type Distribution ---
+    if "attack_type" in flows.columns:
+        # Most common attack type
+        agg_exprs.append(F.first("attack_type").alias("most_common_attack_type"))
+
+    # --- Malware Family ---
+    if "malware_family" in flows.columns:
+        agg_exprs.append(F.first("malware_family").alias("most_common_malware_family"))
+
+    # Perform aggregation
+    device_stats = (
+        flows
+        .groupBy("device_ip", "label")
+        .agg(*agg_exprs)
     )
 
-    device_stats = device_stats.join(device_labels, on="device_ip", how="left")
+    print(f"   ✅ Aggregated {len(agg_exprs)} features per (device_ip, label)")
 
-    # ------------------------------------------------------------------
-    # Attach device_malware_family
-    # ------------------------------------------------------------------
-    # pandas version:
-    #   malicious_devices = df[df['label']=="Malicious"].groupby(device)['malware_family'].agg(mode)
-    #
-    # We'll do:
-    #   - filter malicious rows only
-    #   - first(malware_family) for each device
-    # then join
-    if "malware_family" in df.columns:
-        malicious_fam = (
-            df.filter(F.col("label") == "Malicious")
-            .groupBy("device_ip")
-            .agg(F.first("malware_family").alias("device_malware_family"))
-        )
-        device_stats = device_stats.join(malicious_fam, on="device_ip", how="left")
-    else:
-        # fallback if somehow malware_family missing
-        device_stats = device_stats.withColumn("device_malware_family", F.lit(None).cast("string"))
+    # ========================================
+    # 4. DEVICE-LEVEL DERIVED FEATURES
+    # ========================================
 
-    # Fill Benign for devices without a malware family
+    print("\n🧮 Creating derived features...")
+
+    # Malicious flow ratio
     device_stats = device_stats.withColumn(
-        "device_malware_family",
+        "malicious_flow_ratio",
         F.when(
-            F.col("device_malware_family").isNull() & (F.col("device_label") != "Malicious"),
-            F.lit("Benign")
-        ).otherwise(F.col("device_malware_family"))
+            F.col("total_flows") > 0,
+            F.col("malicious_flows") / F.col("total_flows")
+        ).otherwise(0.0)
     )
 
-    # ------------------------------------------------------------------
-    # Cleanup nulls
-    # ------------------------------------------------------------------
-    print("â³ Cleaning nulls...")
-    # stddev can be null for single-flow devices, fill with 0
-    device_stats = device_stats.fillna(0)
-    # malware family final fallback
-    device_stats = device_stats.fillna({"device_malware_family": "Benign"})
+    # Average bytes per flow
+    device_stats = device_stats.withColumn(
+        "avg_bytes_per_flow",
+        F.when(
+            F.col("total_flows") > 0,
+            (F.col("orig_bytes_total") + F.col("resp_bytes_total")) / F.col("total_flows")
+        ).otherwise(0.0)
+    )
 
-    # Count device rows
+    # Port diversity (number of unique ports used)
+    port_diversity = 0
+    for port_flag in ["is_port_23", "is_port_22", "is_port_80", "is_port_443"]:
+        col_name = f"{port_flag}_count"
+        if col_name in device_stats.columns:
+            port_diversity += F.when(F.col(col_name) > 0, 1).otherwise(0)
+
+    device_stats = device_stats.withColumn("port_diversity", port_diversity)
+
+    print(f"   ✅ Created derived features: malicious_ratio, avg_bytes_per_flow, port_diversity")
+
+    # ========================================
+    # 5. FILL NULLS & VALIDATION
+    # ========================================
+
+    print("\n🔍 Handling nulls and validating...")
+
+    # Fill null statistics with 0
+    stat_cols = [c for c in device_stats.columns if c not in ["device_ip", "label"]]
+    for col in stat_cols:
+        device_stats = device_stats.withColumn(col, F.coalesce(F.col(col), F.lit(0.0)))
+
+    # Validate
+    validate_dataframe(device_stats, "Device Statistics")
+
+    # ========================================
+    # 6. SAVE DEVICE FEATURES
+    # ========================================
+
+    print("\n💾 Saving device features...")
+
+    # Persist before counting (will be used for write)
+    device_stats = smart_persist(device_stats)
+
     device_count = device_stats.count()
-    print(f"\nâœ“ Created {device_count:,} device profiles")
+    feature_count = len(device_stats.columns)
 
-    # ------------------------------------------------------------------
-    # Save device-level parquet
-    # ------------------------------------------------------------------
-    print(f"\nðŸ’¾ Saving device features to: {Config.DEVICE_FEATURES_PATH}")
-    (
-        device_stats.write
-        .mode("overwrite")
-        .parquet(Config.DEVICE_FEATURES_PATH, compression="snappy")
+    print(f"   Devices: {device_count:,}")
+    print(f"   Features: {feature_count}")
+
+    # Write parquet
+    write_parquet_optimized(
+        device_stats,
+        Config.DEVICE_FEATURES_PATH,
+        mode="overwrite",
+        coalesce=True
     )
 
-    # ------------------------------------------------------------------
-    # Small summary stats (collected to driver)
-    # ------------------------------------------------------------------
-    print("\nðŸ“Š Device Statistics:")
+    print(f"✅ Saved to {Config.DEVICE_FEATURES_PATH}")
 
-    print(f"   Total devices: {device_count:,}")
+    # ========================================
+    # 7. SUMMARY STATISTICS
+    # ========================================
 
-    label_counts = (
-        device_stats.groupBy("device_label")
-        .agg(F.count(F.lit(1)).alias("cnt"))
+    print("\n" + "=" * 70)
+    print("📊 DEVICE AGGREGATION SUMMARY")
+    print("=" * 70)
+
+    # Label distribution at device level
+    label_dist = device_stats.groupBy("label").count().collect()
+    print("\nDevice-level label distribution:")
+    for row in label_dist:
+        print(f"   {row['label']}: {row['count']:,} devices")
+
+    # Top malicious devices
+    print("\nTop 5 devices by malicious flow count:")
+    top_malicious = (
+        device_stats
+        .filter(F.col("malicious_flows") > 0)
+        .orderBy(F.desc("malicious_flows"))
+        .limit(5)
+        .select("device_ip", "malicious_flows", "total_flows", "malicious_flow_ratio")
         .collect()
     )
-    for row in label_counts:
-        print(f"   {row['device_label']}: {row['cnt']:,}")
 
-    agg_summary = device_stats.agg(
-        F.mean("flow_count").alias("avg_flows"),
-        F.max("flow_count").alias("max_flows")
-    ).collect()[0]
+    for row in top_malicious:
+        print(
+            f"   {row['device_ip']}: {row['malicious_flows']:,} malicious / {row['total_flows']:,} total ({row['malicious_flow_ratio']:.2%})")
 
-    avg_flows = agg_summary["avg_flows"]
-    max_flows = agg_summary["max_flows"]
-
-    print(f"   Avg flows per device: {avg_flows:.1f}")
-    print(f"   Max flows per device: {int(max_flows)}")
-
-    print("\nâœ… Device aggregation complete!")
+    print("\n" + "=" * 70)
+    print("✅ DEVICE AGGREGATION COMPLETE!")
+    print("=" * 70)
+    print(f"📊 Output: {device_count:,} devices × {feature_count} features")
+    print(f"📂 Saved: {Config.DEVICE_FEATURES_PATH}")
     print("=" * 70)
 
     return device_stats
 
 
+# ============================================================================
+# STANDALONE EXECUTION
+# ============================================================================
+
 if __name__ == "__main__":
-    # Standalone debug mode:
     Config.ensure_output_dirs()
-    spark = (
-        SparkSession.builder
-        .appName("Stage2-DeviceAggregation-Standalone")
-        .config("spark.master", "local[*]")
-        .config("spark.driver.memory", "8g")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
+    spark = Config.get_spark_session("Stage2-DeviceAggregation")
 
     try:
         aggregate_devices_spark(spark)
     finally:
-        spark.stop()
+        if not Config.is_databricks():
+            spark.stop()
+            print("🧹 Spark session stopped")

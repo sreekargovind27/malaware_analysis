@@ -9,7 +9,7 @@ from datetime import datetime
 
 # We need to add the project root to the path to import Config
 # This is necessary because we are running this script directly.
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', '..')))
 from config import Config
 
 

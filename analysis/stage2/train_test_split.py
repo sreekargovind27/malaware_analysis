@@ -1,171 +1,287 @@
 """
-Stage 2: Train/Val/Test Split - PySpark Version
-Splits the engineered flow-level dataset into train/val/test sets.
-Maintains class balance where possible.
+Stage 2: Train/Val/Test Splitting - PySpark Version
+Works on both local and Databricks with automatic optimization.
+
+Pipeline:
+1. Load engineered flow features
+2. Create stratified splits (70% train, 10% val, 20% test)
+3. Validate class distributions
+4. Save splits as parquet files
+
+Optimizations:
+- Uses Spark's native stratified sampling (sampleBy)
+- Smart repartitioning for efficient writes
+- Validation of class balance
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pyspark.sql import functions as F
-from pyspark.sql import SparkSession
 
 from config import Config
+from analysis.stage2.utils import (
+    load_engineered_data_spark, write_parquet_optimized,
+    print_environment_info, validate_dataframe
+)
 
 
-def _stratified_split(df, label_col, seed, train_frac=0.7, val_frac=0.1, test_frac=0.2):
+# ============================================================================
+# STRATIFIED SPLITTING
+# ============================================================================
+
+def create_stratified_splits(df, label_col="label", train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, seed=None):
     """
-    Deterministic per-class split:
-    - For each label, assign a uniform random number in [0,1)
-    - Cut by thresholds so ~70/10/20 per class.
-    Returns (train_df, val_df, test_df).
+    Create stratified train/val/test splits using Spark's sampleBy.
+
+    Args:
+        df: Spark DataFrame with features
+        label_col: Column name for stratification
+        train_ratio: Fraction for training set (default: 0.7)
+        val_ratio: Fraction for validation set (default: 0.1)
+        test_ratio: Fraction for test set (default: 0.2)
+        seed: Random seed for reproducibility
+
+    Returns:
+        tuple: (train_df, val_df, test_df)
     """
-    # safety check: fractions should sum to ~1.0
-    assert abs((train_frac + val_frac + test_frac) - 1.0) < 1e-6, "fractions must sum to 1.0"
+    if seed is None:
+        seed = Config.RANDOM_STATE
 
-    # window-less stratification trick:
-    # random value seeded on (label, uid-ish surrogate) would be ideal,
-    # but we’ll just use a seeded rand() which is stable per run.
-    df_with_r = df.withColumn("_rand", F.rand(seed))
+    if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 0.01:
+        raise ValueError(f"Ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio}")
 
-    # threshold cuts
-    train_cut = train_frac
-    val_cut = train_frac + val_frac  # e.g. 0.7 + 0.1 = 0.8
+    print(f"\n🔀 Creating stratified splits ({train_ratio:.0%}/{val_ratio:.0%}/{test_ratio:.0%})...")
 
-    train_df = df_with_r.filter(F.col("_rand") < train_cut)
-    val_df = df_with_r.filter((F.col("_rand") >= train_cut) & (F.col("_rand") < val_cut))
-    test_df = df_with_r.filter(F.col("_rand") >= val_cut)
+    # Get class distribution
+    label_counts = df.groupBy(label_col).count().collect()
+    class_dict = {row[label_col]: row['count'] for row in label_counts}
 
-    # drop helper col
-    train_df = train_df.drop("_rand")
-    val_df = val_df.drop("_rand")
-    test_df = test_df.drop("_rand")
+    print(f"   Class distribution:")
+    for label, count in class_dict.items():
+        print(f"      {label}: {count:,} samples")
+
+    # Create fractions dictionary for sampleBy
+    # sampleBy expects: {class_value: fraction_to_sample}
+    train_fractions = {label: train_ratio for label in class_dict.keys()}
+
+    # Sample training set
+    print(f"\n   Sampling training set ({train_ratio:.0%})...")
+    train_df = df.sampleBy(label_col, train_fractions, seed=seed)
+
+    # Remaining data (for val + test)
+    print(f"   Computing remaining data...")
+    remaining_df = df.subtract(train_df)
+
+    # Split remaining into val/test
+    # Adjust ratios for remaining data (val + test = 1 - train_ratio)
+    remaining_total = val_ratio + test_ratio
+    val_fraction_of_remaining = val_ratio / remaining_total
+
+    val_fractions = {label: val_fraction_of_remaining for label in class_dict.keys()}
+
+    print(f"   Sampling validation set ({val_ratio:.0%} of original)...")
+    val_df = remaining_df.sampleBy(label_col, val_fractions, seed=seed + 1)
+
+    print(f"   Computing test set...")
+    test_df = remaining_df.subtract(val_df)
 
     return train_df, val_df, test_df
 
 
+# ============================================================================
+# SPLIT VALIDATION
+# ============================================================================
+
+def validate_splits(train_df, val_df, test_df, label_col="label"):
+    """
+    Validate that splits have reasonable class distributions.
+
+    Args:
+        train_df: Training set
+        val_df: Validation set
+        test_df: Test set
+        label_col: Label column name
+    """
+    print("\n🔍 Validating splits...")
+
+    # Count each split
+    train_count = train_df.count()
+    val_count = val_df.count()
+    test_count = test_df.count()
+    total = train_count + val_count + test_count
+
+    print(f"\n📊 Split sizes:")
+    print(f"   Train: {train_count:,} ({train_count / total:.1%})")
+    print(f"   Val:   {val_count:,} ({val_count / total:.1%})")
+    print(f"   Test:  {test_count:,} ({test_count / total:.1%})")
+    print(f"   Total: {total:,}")
+
+    # Check class distributions
+    print(f"\n📊 Class distributions per split:")
+
+    for split_name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        label_dist = split_df.groupBy(label_col).count().collect()
+        split_total = split_df.count()
+
+        print(f"\n   {split_name}:")
+        for row in sorted(label_dist, key=lambda x: x['count'], reverse=True):
+            label = row[label_col]
+            count = row['count']
+            pct = (count / split_total * 100) if split_total > 0 else 0
+            print(f"      {label}: {count:,} ({pct:.1f}%)")
+
+    # Check for data leakage (overlapping rows)
+    print(f"\n🔍 Checking for data leakage...")
+
+    train_val_overlap = train_df.intersect(val_df).count()
+    train_test_overlap = train_df.intersect(test_df).count()
+    val_test_overlap = val_df.intersect(test_df).count()
+
+    if train_val_overlap > 0 or train_test_overlap > 0 or val_test_overlap > 0:
+        print(f"   ⚠️  WARNING: Data leakage detected!")
+        print(f"      Train-Val overlap: {train_val_overlap:,}")
+        print(f"      Train-Test overlap: {train_test_overlap:,}")
+        print(f"      Val-Test overlap: {val_test_overlap:,}")
+    else:
+        print(f"   ✅ No data leakage (splits are disjoint)")
+
+    print(f"\n✅ Split validation complete")
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
 def create_and_save_master_splits_spark(spark):
     """
-    Creates 70/10/20 train/val/test splits from the engineered flow dataset.
-    Uses stratified-style sampling if the 'label' column exists.
+    Main train/val/test splitting pipeline.
+    Loads engineered data, creates stratified splits, saves parquet files.
+
+    Args:
+        spark: Active SparkSession
     """
     print("\n" + "=" * 70)
-    print("✂️  TRAIN/VAL/TEST SPLITTING (PySpark)")
+    print("STAGE 2: TRAIN/VAL/TEST SPLITTING")
     print("=" * 70)
 
-    print("📂 Loading engineered flow features...")
-    df = spark.read.parquet(Config.ENGINEERED_DATA_PATH)
+    print_environment_info(spark)
 
-    total_rows = df.count()
-    print(f"✓ Loaded {total_rows:,} rows")
+    # ========================================
+    # 1. LOAD ENGINEERED DATA
+    # ========================================
 
-    if total_rows == 0:
-        print("❌ No rows found — skipping split stage.")
-        return
+    flows = load_engineered_data_spark(spark)
 
-    # -------------------------------------------------------------
-    # If we have a label column, do per-class random cut.
-    # Otherwise fallback to plain randomSplit.
-    # -------------------------------------------------------------
-    if "label" in df.columns:
-        print("⚖️  Performing per-class 70/10/20 split using seeded random thresholds...")
-        train_df, val_df, test_df = _stratified_split(
-            df,
-            label_col="label",
-            seed=Config.RANDOM_STATE,
-            train_frac=0.7,
-            val_frac=0.1,
-            test_frac=0.2,
-        )
+    # Validate required columns
+    if Config.TARGET_COL not in flows.columns:
+        raise ValueError(f"Target column '{Config.TARGET_COL}' not found in data")
+
+    total_rows = flows.count()
+    print(f"\n📊 Input: {total_rows:,} flows")
+
+    # ========================================
+    # 2. CREATE STRATIFIED SPLITS
+    # ========================================
+
+    train_df, val_df, test_df = create_stratified_splits(
+        flows,
+        label_col=Config.TARGET_COL,
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        seed=Config.RANDOM_STATE
+    )
+
+    # ========================================
+    # 3. VALIDATE SPLITS
+    # ========================================
+
+    validate_splits(train_df, val_df, test_df, label_col=Config.TARGET_COL)
+
+    # ========================================
+    # 4. SAVE SPLITS
+    # ========================================
+
+    print("\n💾 Saving splits to parquet...")
+
+    # Determine partition count based on environment
+    if Config.is_databricks():
+        num_partitions = Config.DATABRICKS_COALESCE_PARTITIONS
     else:
-        print("⚠️  No 'label' column found — using global randomSplit.")
-        train_df, val_df, test_df = df.randomSplit(
-            [0.7, 0.1, 0.2],
-            seed=Config.RANDOM_STATE
-        )
+        num_partitions = 4
 
-    # -------------------------------------------------------------
-    # Count & print summary
-    # -------------------------------------------------------------
+    # Save train set
+    print(f"\n   [1/3] Saving training set...")
+    write_parquet_optimized(
+        train_df,
+        Config.TRAIN_PATH,
+        mode="overwrite",
+        coalesce=True
+    )
+    print(f"   ✅ Saved to {Config.TRAIN_PATH}")
+
+    # Save validation set
+    print(f"\n   [2/3] Saving validation set...")
+    write_parquet_optimized(
+        val_df,
+        Config.VAL_PATH,
+        mode="overwrite",
+        coalesce=True
+    )
+    print(f"   ✅ Saved to {Config.VAL_PATH}")
+
+    # Save test set
+    print(f"\n   [3/3] Saving test set...")
+    write_parquet_optimized(
+        test_df,
+        Config.TEST_PATH,
+        mode="overwrite",
+        coalesce=True
+    )
+    print(f"   ✅ Saved to {Config.TEST_PATH}")
+
+    # ========================================
+    # 5. FINAL SUMMARY
+    # ========================================
+
+    print("\n" + "=" * 70)
+    print("✅ TRAIN/VAL/TEST SPLITTING COMPLETE!")
+    print("=" * 70)
+
     train_count = train_df.count()
     val_count = val_df.count()
     test_count = test_df.count()
 
-    total_after = train_count + val_count + test_count
-    if total_after == 0:
-        print("❌ All splits are empty — aborting save.")
-        return
+    print(f"\n📊 Split Summary:")
+    print(f"   Training:   {train_count:,} samples ({train_count / total_rows:.1%})")
+    print(f"   Validation: {val_count:,} samples ({val_count / total_rows:.1%})")
+    print(f"   Test:       {test_count:,} samples ({test_count / total_rows:.1%})")
+    print(f"   Total:      {total_rows:,} samples")
 
-    print("\n✓ Split complete:")
-    print(f"   Train: {train_count:,} ({train_count / total_after * 100:.1f}%)")
-    print(f"   Val:   {val_count:,} ({val_count / total_after * 100:.1f}%)")
-    print(f"   Test:  {test_count:,} ({test_count / total_after * 100:.1f}%)")
+    print(f"\n📂 Output Files:")
+    print(f"   Train: {Config.TRAIN_PATH}")
+    print(f"   Val:   {Config.VAL_PATH}")
+    print(f"   Test:  {Config.TEST_PATH}")
 
-    # Optional: sanity check class balance in train vs test (tiny collect)
-    if "label" in df.columns:
-        def show_dist(name, dframe):
-            dist_rows = (
-                dframe.groupBy("label")
-                .agg(F.count(F.lit(1)).alias("cnt"))
-                .collect()
-            )
-            print(f"\n   {name} label distribution:")
-            for row in dist_rows:
-                print(f"     {row['label']}: {row['cnt']:,}")
-
-        show_dist("Train", train_df)
-        show_dist("Val", val_df)
-        show_dist("Test", test_df)
-
-    # -------------------------------------------------------------
-    # Save splits
-    # -------------------------------------------------------------
-    print("\n💾 Saving splits to parquet...")
-
-    (
-        train_df.write
-        .mode("overwrite")
-        .parquet(Config.TRAIN_SET_PATH, compression="snappy")
-    )
-    print(f"   ✓ Train → {Config.TRAIN_SET_PATH}")
-
-    (
-        val_df.write
-        .mode("overwrite")
-        .parquet(Config.VAL_SET_PATH, compression="snappy")
-    )
-    print(f"   ✓ Val   → {Config.VAL_SET_PATH}")
-
-    (
-        test_df.write
-        .mode("overwrite")
-        .parquet(Config.TEST_SET_PATH, compression="snappy")
-    )
-    print(f"   ✓ Test  → {Config.TEST_SET_PATH}")
-
-    print("\n✅ Train/Val/Test split stage complete!")
-    print("=" * 70)
+    print("\n" + "=" * 70)
 
     return train_df, val_df, test_df
 
 
+# ============================================================================
+# STANDALONE EXECUTION
+# ============================================================================
+
 if __name__ == "__main__":
-    # Allow debugging standalone
     Config.ensure_output_dirs()
-    spark = (
-        SparkSession.builder
-        .appName("Stage2-TrainValTestSplit-Standalone")
-        .config("spark.master", "local[*]")
-        .config("spark.driver.memory", "8g")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
+    spark = Config.get_spark_session("Stage2-TrainValTestSplit")
 
     try:
         create_and_save_master_splits_spark(spark)
     finally:
-        spark.stop()
+        if not Config.is_databricks():
+            spark.stop()
+            print("🧹 Spark session stopped")

@@ -1,11 +1,10 @@
 """
 Central configuration for IoT-23 pipeline (data prep, modeling, outputs).
-Covers:
-- Paths
-- Sampling / split settings
-- Feature definitions
-- Spark helpers
-- Training hyperparams (for later stages)
+Unified config that works both locally and on Databricks.
+
+Environment Detection:
+- Local: Uses local filesystem paths, local[*] Spark
+- Databricks: Uses DBFS paths, cluster Spark with optimized settings
 """
 
 import os
@@ -14,27 +13,84 @@ import torch
 
 
 class Config:
-    # ------------------------------------------------------------------
-    # MODE / SAMPLING
-    # ------------------------------------------------------------------
-    TEST_MODE = True
+    # ==================================================================
+    # DATABRICKS CONFIGURATION - ALL SETTINGS IN ONE PLACE
+    # ==================================================================
 
-    # For Spark feature_engineering: take full data or downsample.
+    # Environment-specific Spark settings
+    DATABRICKS_SHUFFLE_PARTITIONS = 200  # For 40-50GB data (increase if needed)
+    DATABRICKS_REPARTITION_SIZE = 200  # Default repartition size for groupBy operations
+    DATABRICKS_COALESCE_PARTITIONS = 100  # For final parquet writes
+    DATABRICKS_ENABLE_ADAPTIVE = True  # Adaptive query execution (AQE)
+    DATABRICKS_ENABLE_AQE_SKEW = True  # Handle data skew automatically
+    DATABRICKS_ENABLE_AQE_COALESCE = True  # Coalesce partitions automatically
+
+    LOCAL_SHUFFLE_PARTITIONS = 8  # For local testing (small data)
+    LOCAL_REPARTITION_SIZE = 8  # For local testing
+    LOCAL_DRIVER_MEMORY = "8g"  # Local driver memory
+    LOCAL_EXECUTOR_MEMORY = "8g"  # Local executor memory
+
+    # Path configuration
+    DATABRICKS_BASE_PATH = "/dbfs/mnt/iot23"  # Mounted storage path
+    # Alternative: "dbfs:/iot23" for direct DBFS (without /dbfs prefix)
+
+    # Graph building limits (prevent OOM on collect)
+    MAX_NODES_TO_COLLECT = 100000  # Max nodes before refusing collect()
+
+    # File write settings
+    MAX_RECORDS_PER_FILE = 1000000  # Control output file size
+    COMPRESSION_CODEC = "snappy"  # Parquet compression
+
+    # Storage level for persist operations
+    PERSIST_STORAGE_LEVEL = "MEMORY_AND_DISK"  # Options: MEMORY_ONLY, MEMORY_AND_DISK, DISK_ONLY
+
+    # ==================================================================
+    # ENVIRONMENT DETECTION
+    # ==================================================================
+
+    @staticmethod
+    def is_databricks():
+        """Detect if running on Databricks"""
+        return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+    @staticmethod
+    def get_environment():
+        """Get current environment name"""
+        return "Databricks" if Config.is_databricks() else "Local"
+
+    # ==================================================================
+    # MODE / SAMPLING
+    # ==================================================================
+
+    TEST_MODE = True  # Set to True for small test data, False for full 40GB run
+
+    # For Spark feature_engineering: take full data or downsample
     # 1.0 = use 100% of rows; 0.1 = 10%; etc.
     DATA_SAMPLE_FRACTION = 1.0
 
-    # If you later implement class-aware sampling during Spark load.
+    # Stratified sampling
     USE_STRATIFIED_SAMPLING = True
 
     # Random seed for splits, sampling, model init, etc.
     RANDOM_STATE = 42
 
-    # ------------------------------------------------------------------
-    # PROJECT ROOTS / IO PATHS
-    # ------------------------------------------------------------------
-    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    # ==================================================================
+    # PROJECT ROOTS / IO PATHS (Environment-Aware)
+    # ==================================================================
 
-    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+    # Determine base path inline (avoid circular dependency)
+    if os.path.exists('/dbfs'):
+        BASE_PATH = "/dbfs/mnt/iot23"
+    else:
+        BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
+
+    @staticmethod
+    def get_base_path():
+        """Get base path (already computed)"""
+        return Config.BASE_PATH
+
+    # Data directories
+    DATA_DIR = os.path.join(BASE_PATH, "data")
 
     RAW_DIR_MESSY = os.path.join(
         DATA_DIR, "raw_messy_test" if TEST_MODE else "raw_messy"
@@ -43,7 +99,8 @@ class Config:
         DATA_DIR, "raw_test" if TEST_MODE else "raw"
     )
 
-    OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
+    # Outputs
+    OUTPUTS_DIR = os.path.join(BASE_PATH, "outputs")
 
     # Stage 1 (exploration / sanity reports)
     STAGE1_FEASIBILITY_DIR = os.path.join(OUTPUTS_DIR, "stage1_feasibility")
@@ -57,7 +114,7 @@ class Config:
     NORMALIZED_DIR = os.path.join(STAGE2_PREPARED_DIR, "normalized")
     GRAPH_DIR = os.path.join(STAGE2_PREPARED_DIR, "graph")
 
-    # Models (Stage 3+)
+    # Models (Stage 3+ - for future use, not on Databricks)
     MODELS_DIR = os.path.join(OUTPUTS_DIR, "models_trained")
     TRADITIONAL_MODELS_DIR = os.path.join(MODELS_DIR, "traditional")
     DL_MODELS_DIR = os.path.join(MODELS_DIR, "deep_learning")
@@ -67,157 +124,144 @@ class Config:
     # Results / reports
     RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
     BINARY_RESULTS_DIR = os.path.join(RESULTS_DIR, "binary_classification")
-    MULTICLASS_RESULTS_DIR = os.path.join(RESULTS_DIR, "multiclass")
+    MULTICLASS_RESULTS_DIR = os.path.join(RESULTS_DIR, "multiclass_classification")
     FAMILY_RESULTS_DIR = os.path.join(RESULTS_DIR, "malware_family")
     AUTOENCODER_RESULTS_DIR = os.path.join(RESULTS_DIR, "autoencoder")
     CLUSTERING_RESULTS_DIR = os.path.join(RESULTS_DIR, "clustering")
     GAN_RESULTS_DIR = os.path.join(RESULTS_DIR, "gan")
 
+    # Logs
     LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
 
-    # ------------------------------------------------------------------
-    # STAGE 2 OUTPUT ARTIFACTS
-    # ------------------------------------------------------------------
-    ENGINEERED_DATA_PATH = os.path.join(
-        STAGE2_PREPARED_DIR, "flow_features.parquet"
-    )
-    ENGINEERED_DATA_PATH_CSV = os.path.join(
-        STAGE2_PREPARED_DIR, "flow_features.csv"
-    )
+    # ==================================================================
+    # SPECIFIC FILE PATHS
+    # ==================================================================
 
-    DEVICE_FEATURES_PATH = os.path.join(
-        STAGE2_PREPARED_DIR, "device_features.parquet"
-    )
+    # Stage 2 outputs
+    ENGINEERED_DATA_PATH = os.path.join(STAGE2_PREPARED_DIR, "engineered_flows.parquet")
+    DEVICE_FEATURES_PATH = os.path.join(STAGE2_PREPARED_DIR, "device_features.parquet")
+    FEATURE_LIST_PATH = os.path.join(STAGE2_PREPARED_DIR, "feature_list.joblib")
 
-    FEATURE_LIST_PATH = os.path.join(
-        STAGE2_PREPARED_DIR, "feature_list.joblib"
-    )
-    AUTOENCODER_FEATURE_LIST_PATH = os.path.join(
-        STAGE2_PREPARED_DIR, "autoencoder_feature_list.joblib"
-    )
+    # Train/Val/Test splits
+    TRAIN_PATH = os.path.join(SPLITS_DIR, "train.parquet")
+    VAL_PATH = os.path.join(SPLITS_DIR, "val.parquet")
+    TEST_PATH = os.path.join(SPLITS_DIR, "test.parquet")
 
-    TRAIN_SET_PATH = os.path.join(SPLITS_DIR, "train_flows.parquet")
-    VAL_SET_PATH = os.path.join(SPLITS_DIR, "val_flows.parquet")
-    TEST_SET_PATH = os.path.join(SPLITS_DIR, "test_flows.parquet")
+    # Normalized versions (for deep learning)
+    TRAIN_NORMALIZED_PATH = os.path.join(NORMALIZED_DIR, "train_normalized.parquet")
+    VAL_NORMALIZED_PATH = os.path.join(NORMALIZED_DIR, "val_normalized.parquet")
+    TEST_NORMALIZED_PATH = os.path.join(NORMALIZED_DIR, "test_normalized.parquet")
+    SCALER_PATH = os.path.join(NORMALIZED_DIR, "scaler.joblib")
 
-    SCALER_PATH = os.path.join(NORMALIZED_DIR, "flow_scaler.pkl")
-
-    # Graph / GNN artifacts
+    # Graph outputs
     HETERO_GRAPH_PATH = os.path.join(GRAPH_DIR, "hetero_graph.pt")
-    DEVICE_NODES_PATH = os.path.join(GRAPH_DIR, "device_nodes.parquet")
-    SERVICE_NODES_PATH = os.path.join(GRAPH_DIR, "service_nodes.parquet")
-    SUBNET_NODES_PATH = os.path.join(GRAPH_DIR, "subnet_nodes.parquet")
-    EDGES_PATH = os.path.join(GRAPH_DIR, "edges.parquet")
     GRAPH_STATS_PATH = os.path.join(GRAPH_DIR, "graph_stats.json")
 
-    # ------------------------------------------------------------------
-    # DATASET / LABEL SEMANTICS
-    # ------------------------------------------------------------------
-    SAMPLE_SIZE = 50_000_000
-    TEST_SIZE = 0.2
+    # Backward compatibility aliases
+    TRAIN_SET_PATH = TRAIN_PATH
+    VAL_SET_PATH = VAL_PATH
+    TEST_SET_PATH = TEST_PATH
 
-    FILENAME_TO_FAMILY_MAP = {
-        "CTU-IoT-Malware-Capture-1-1": "Mirai",
-        "CTU-IoT-Malware-Capture-7-1": "Mirai",
-        "CTU-IoT-Malware-Capture-8-1": "Mirai",
-        "CTU-IoT-Malware-Capture-9-1": "Mirai",
-        "CTU-IoT-Malware-Capture-20-1": "Mirai",
-        "CTU-IoT-Malware-Capture-21-1": "Mirai",
-        "CTU-IoT-Malware-Capture-33-1": "Mirai",
-        "CTU-IoT-Malware-Capture-34-1": "Mirai",
-        "CTU-IoT-Malware-Capture-35-1": "Mirai",
-        "CTU-IoT-Malware-Capture-36-1": "Mirai",
-        "CTU-IoT-Malware-Capture-42-1": "Mirai",
-        "CTU-IoT-Malware-Capture-43-1": "Mirai",
-        "CTU-IoT-Malware-Capture-44-1": "Mirai",
-        "CTU-IoT-Malware-Capture-48-1": "Mirai",
-        "CTU-IoT-Malware-Capture-49-1": "Mirai",
-        "CTU-IoT-Malware-Capture-52-1": "Mirai",
-        "CTU-IoT-Malware-Capture-60-1": "Mirai",
-        "CTU-IoT-Malware-Capture-3-1": "Kenjiro",
-        "CTU-IoT-Malware-Capture-39-1": "Kenjiro",
-        "CTU-IoT-Malware-Capture-5-1": "Torii",
-        "CTU-IoT-Malware-Capture-17-1": "Gagfyt",
-        "CTU-IoT-Malware-Capture-41-1": "Gagfyt",
-        "CTU-IoT-Malware-Capture-51-1": "Gagfyt",
-        "CTU-IoT-Malware-Capture-37-1": "Okiru",
-        "CTU-IoT-Malware-Capture-46-1": "Muhstik",
-        "CTU-IoT-Malware-Capture-40-1": "Hajime",
-        "CTU-IoT-Malware-Capture-53-1": "Hide and Seek",
-        "CTU-IoT-Malware-Capture-54-1": "Hakai",
-        "CTU-IoT-Malware-Capture-55-1": "IRCBot",
-        "CTU-IoT-Malware-Capture-56-1": "Trojan",
-        "CTU-Honeypot-Capture-4-1": "Benign",
-        "CTU-Honeypot-Capture-5-1": "Benign",
-        "CTU-Honeypot-Capture-7-1": "Benign",
-    }
-
-    # ------------------------------------------------------------------
+    # ==================================================================
     # FEATURE DEFINITIONS
-    # ------------------------------------------------------------------
-    BASE_NUMERICAL_FEATURES = [
-        "duration",
-        "orig_bytes",
-        "resp_bytes",
-        "orig_pkts",
-        "resp_pkts",
-        "orig_ip_bytes",
-        "resp_ip_bytes",
-        "missed_bytes",
-        "id.resp_p",  # port, cast to double + _was_missing
+    # ==================================================================
+
+    TARGET_COL = "label"  # Binary: Benign / Malicious
+    DETAILED_TARGET_COL = "attack_type"  # Multi-class attack type
+    FAMILY_TARGET_COL = "malware_family"  # Malware family
+
+    # Core numeric features (time/duration)
+    NUMERIC_COLS = [
+        "duration", "orig_bytes", "resp_bytes", "missed_bytes",
+        "orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes",
     ]
 
-    SKEWED_NUMERICAL_FEATURES = [
-        "duration",
-        "orig_bytes",
-        "resp_bytes",
-        "orig_pkts",
-        "resp_pkts",
-        "orig_ip_bytes",
-        "resp_ip_bytes",
-    ]
+    # Port features
+    PORT_COLS = ["id.orig_p", "id.resp_p"]
 
-    # (Informational; Stage 2 currently builds these manually.)
-    CATEGORICAL_LABEL_ENCODE = ["service", "history"]
-    CATEGORICAL_ONE_HOT_ENCODE = ["proto", "conn_state"]
-
-    # (Informational; Stage 2 derives orig_/resp_ private/multicast/etc.)
-    IP_FEATURES_BASE = [
-        "is_private",
-        "is_broadcast",
-        "is_multicast",
-        "ip_first_octet",
-        "is_localhost",
-    ]
-
-    # Features we engineer in Stage 2
-    ENGINEERED_FEATURES = [
-        "is_port_23",
-        "is_port_22",
-        "is_S0_state",
-        "is_telnet",
-        "is_unknown_service",
-        "upload_ratio",
-        "bytes_per_packet",
-        "packet_rate",
-        "suspicious_score",
-    ]
-
-    # Targets we predict
-    TARGET_COL = "label"
-    DETAILED_TARGET_COL = "attack_type"
-    FAMILY_TARGET_COL = "malware_family"
+    # Categorical features
+    CATEGORICAL_COLS = ["proto", "service", "conn_state", "history"]
 
     @staticmethod
     def get_feature_list():
+        """
+        Load the feature list from joblib or return a default list.
+        This is the final feature set for modeling.
+        """
         if os.path.exists(Config.FEATURE_LIST_PATH):
             return joblib.load(Config.FEATURE_LIST_PATH)
-        print("Warning: Feature list not found on disk.")
         return []
 
-    # ------------------------------------------------------------------
-    # TRAINING / MODELING HYPERPARAMS
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SPARK SESSION (Unified for Local + Databricks)
+    # ==================================================================
+
+    @staticmethod
+    def get_spark_session(app_name="IoT23-DataPipeline"):
+        """
+        Build or get a SparkSession that works both locally and on Databricks.
+        Auto-detects environment and configures appropriately.
+
+        Args:
+            app_name: Name for the Spark application
+
+        Returns:
+            SparkSession configured for the current environment
+        """
+        from pyspark.sql import SparkSession
+
+        builder = SparkSession.builder.appName(app_name)
+
+        if Config.is_databricks():
+            # ===== DATABRICKS CLUSTER =====
+            print("🔧 Detected Databricks environment")
+            print(f"   Databricks Runtime: {os.environ.get('DATABRICKS_RUNTIME_VERSION', 'Unknown')}")
+
+            # Databricks manages master, driver memory, executor memory
+            # We only configure optimization settings
+            builder = (builder
+                       .config("spark.sql.shuffle.partitions", str(Config.DATABRICKS_SHUFFLE_PARTITIONS))
+                       .config("spark.sql.adaptive.enabled", str(Config.DATABRICKS_ENABLE_ADAPTIVE).lower())
+                       .config("spark.sql.adaptive.coalescePartitions.enabled",
+                               str(Config.DATABRICKS_ENABLE_AQE_COALESCE).lower())
+                       .config("spark.sql.adaptive.skewJoin.enabled", str(Config.DATABRICKS_ENABLE_AQE_SKEW).lower())
+                       .config("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+                       .config("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256MB")
+                       )
+
+        else:
+            # ===== LOCAL DEVELOPMENT =====
+            print("🔧 Detected local environment")
+
+            builder = (builder
+                       .config("spark.master", "local[*]")
+                       .config("spark.driver.memory", Config.LOCAL_DRIVER_MEMORY)
+                       .config("spark.executor.memory", Config.LOCAL_EXECUTOR_MEMORY)
+                       .config("spark.sql.shuffle.partitions", str(Config.LOCAL_SHUFFLE_PARTITIONS))
+                       .config("spark.default.parallelism", str(Config.LOCAL_SHUFFLE_PARTITIONS))
+                       )
+
+        # ===== COMMON CONFIGS (Both Environments) =====
+        spark = (builder
+                 .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+                 .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+                 .config("spark.ui.showConsoleProgress", "true")
+                 .getOrCreate()
+                 )
+
+        spark.sparkContext.setLogLevel("WARN")
+
+        print(f"✅ Spark session ready: {spark.version}")
+        print(f"   Environment: {Config.get_environment()}")
+        print(f"   Base path: {Config.BASE_PATH}")
+        print(f"   Shuffle partitions: {spark.conf.get('spark.sql.shuffle.partitions')}")
+
+        return spark
+
+    # ==================================================================
+    # TRAINING / MODELING HYPERPARAMS (Not used on Databricks)
+    # ==================================================================
+
     USE_SMOTE = True
     SMOTE_SAMPLE_THRESHOLD = 100_000
 
@@ -227,15 +271,7 @@ class Config:
 
     RUN_LOGISTIC_REGRESSION = True
 
-    # if torch.cuda.is_available():
-    #     DEVICE = "cuda"
-    # elif torch.backends.mps.is_available():
-    #     DEVICE = "mps"
-    # else:
-    #     DEVICE = "cpu"
-    #
-    # TODO - remove
-    DEVICE = "cpu"
+    DEVICE = "cpu"  # For PyTorch models (will be overridden on GPU machines)
 
     NOISE_START = 0.05
     NOISE_WARMUP_EPOCHS = 40
@@ -269,11 +305,13 @@ class Config:
     PIN_MEMORY = True
     N_JOBS = 32
 
-    # ------------------------------------------------------------------
-    # UTIL FUNCS
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # UTILITY FUNCTIONS
+    # ==================================================================
+
     @staticmethod
     def ensure_output_dirs():
+        """Create all necessary output directories"""
         for dir_path in [
             Config.RAW_DIR_MESSY,
             Config.RAW_DIR_ORIGINAL,
@@ -299,6 +337,7 @@ class Config:
 
     @staticmethod
     def set_seeds():
+        """Set random seeds for reproducibility"""
         import random
         import numpy as np
         random.seed(Config.RANDOM_STATE)
@@ -308,31 +347,15 @@ class Config:
             torch.cuda.manual_seed_all(Config.RANDOM_STATE)
 
     @staticmethod
-    def get_spark_session(app_name="IoT23-Analysis"):
-        """
-        Build or get a SparkSession tuned for our pipeline scale.
-        Adjust memory/partitions here if you hit OOM or want more parallelism.
-        """
-        from pyspark.sql import SparkSession
-        spark = (
-            SparkSession.builder
-            .appName(app_name)
-            .config("spark.driver.memory", "8g")
-            .config("spark.sql.shuffle.partitions", "20")
-            .config("spark.default.parallelism", "8")
-            .config("spark.ui.showConsoleProgress", "true")
-            .getOrCreate()
-        )
-        spark.sparkContext.setLogLevel("WARN")
-        return spark
-
-    @staticmethod
     def print_mode_info():
+        """Print current configuration mode"""
         print("\n" + "=" * 70)
         print("CONFIGURATION MODE")
         print("=" * 70)
         mode = "TEST MODE" if Config.TEST_MODE else "PRODUCTION MODE"
         print(f"   Mode: {mode}")
+        print(f"   Environment: {Config.get_environment()}")
         print(f"   Raw Data Directory: {Config.RAW_DIR_ORIGINAL}")
+        print(f"   Output Directory: {Config.OUTPUTS_DIR}")
         print(f"   Device: {Config.DEVICE}")
         print("=" * 70)

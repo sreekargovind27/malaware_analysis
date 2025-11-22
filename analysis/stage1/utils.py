@@ -1,261 +1,431 @@
 """
-FIXED VERSION - Shared utility functions for Stage 1 feasibility analysis (PySpark).
+Stage 1 Utility Functions - PySpark Version
+Works on both local and Databricks.
+
+Provides helper functions for:
+- Loading raw data (with header normalization)
+- Parsing labels (binary, attack_type, malware_family)
+- Getting numeric columns
+- Saving JSON reports
 """
 
 import os
-
+import json
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType
+from pyspark.sql import types as T
 
 from config import Config
 
 
-def load_raw_data(spark):
+# ============================================================================
+# RAW DATA LOADING
+# ============================================================================
+
+def load_raw_data(spark: SparkSession) -> DataFrame:
     """
-    Loads all raw CSV files using PySpark, inferring the schema.
-    This is for analysis only and is robust to minor inconsistencies.
+    Load raw IoT-23 CSVs with header normalization.
+    Tolerant to inconsistent column names across captures.
+
+    Args:
+        spark: Active SparkSession
+
+    Returns:
+        Spark DataFrame with normalized raw data
     """
-    print("\n" + "=" * 70)
-    print("LOADING RAW DATA (PySpark)")
-    print("=" * 70)
+    input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+    print(f"\n📂 Loading raw CSVs from: {input_glob}")
 
-    input_dir = Config.RAW_DIR_ORIGINAL
-
-    if not os.path.exists(input_dir):
-        raise FileNotFoundError(f"Input directory not found: {input_dir}")
-
-    csv_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
-    if not csv_files:
-        raise ValueError(f"No CSV files found in {input_dir}")
-
-    print(f"Found {len(csv_files)} CSV files in {input_dir}")
-
-    # ✅ FINAL FIX: Use inferSchema=True. This is robust enough for analysis
-    # and correctly handles files with slightly different headers.
-    df = spark.read.csv(
-        f"{input_dir}/*.csv",
-        header=True,
-        inferSchema=True,
-        comment='#'
+    # Read all CSVs
+    df = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", True)
+        .option("comment", "#")
+        .option("mode", "PERMISSIVE")
+        .csv(input_glob)
     )
 
-    # --- Robust Casting and Renaming ---
-    print("  Manually casting and renaming columns...")
+    # Add source folder tracking
+    df = df.withColumn(
+        "Source_Folder",
+        F.regexp_extract(F.input_file_name(), r"([^/]+)\.csv$", 1)
+    )
 
-    # Rename columns with dots to use underscores for consistency
-    df = df.withColumnRenamed('id.orig_h', 'id_orig_h') \
-        .withColumnRenamed('id.orig_p', 'id_orig_p') \
-        .withColumnRenamed('id.resp_h', 'id_resp_h') \
-        .withColumnRenamed('id.resp_p', 'id_resp_p')
+    # Normalize column names (handle dotted vs underscored)
+    expected_cols = [
+        "ts", "uid",
+        "id.orig_h", "id.orig_p",
+        "id.resp_h", "id.resp_p",
+        "proto", "service",
+        "duration",
+        "orig_bytes", "resp_bytes",
+        "conn_state",
+        "local_orig", "local_resp",
+        "missed_bytes",
+        "history",
+        "orig_pkts", "orig_ip_bytes",
+        "resp_pkts", "resp_ip_bytes",
+        "label", "detailed-label",
+    ]
 
-    # Cast numeric columns that might be read as strings
-    df = df.withColumn('ts', F.col('ts').cast(DoubleType()))
-    df = df.withColumn('duration', F.col('duration').cast(DoubleType()))
-    df = df.withColumn('orig_bytes', F.col('orig_bytes').cast(IntegerType()))
-    df = df.withColumn('resp_bytes', F.col('resp_bytes').cast(IntegerType()))
-    df = df.withColumn('missed_bytes', F.col('missed_bytes').cast(IntegerType()))
-    df = df.withColumn('orig_pkts', F.col('orig_pkts').cast(IntegerType()))
-    df = df.withColumn('orig_ip_bytes', F.col('orig_ip_bytes').cast(IntegerType()))
-    df = df.withColumn('resp_pkts', F.col('resp_pkts').cast(IntegerType()))
-    df = df.withColumn('resp_ip_bytes', F.col('resp_ip_bytes').cast(IntegerType()))
-    df = df.withColumn('id_orig_p', F.col('id_orig_p').cast(IntegerType()))
-    df = df.withColumn('id_resp_p', F.col('id_resp_p').cast(IntegerType()))
+    existing_cols = df.columns
+    for col_dot in expected_cols:
+        alt = col_dot.replace(".", "_").replace("-", "_")
+        if col_dot not in existing_cols and alt in existing_cols:
+            df = df.withColumnRenamed(alt, col_dot)
 
-    total_rows = df.count()
-    print(f"✓ Total rows loaded: {total_rows:,}")
+    # Ensure missing columns exist
+    for c in expected_cols:
+        if c not in df.columns:
+            df = df.withColumn(c, F.lit(None).cast("string"))
+
+    # Cast numeric columns
+    numeric_cols = [
+        "duration", "orig_bytes", "resp_bytes", "missed_bytes",
+        "orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes"
+    ]
+
+    for nc in numeric_cols:
+        df = df.withColumn(nc, F.col(nc).cast(T.DoubleType()))
+
+    # Cast port columns
+    for port_col in ["id.orig_p", "id.resp_p"]:
+        df = df.withColumn(port_col, F.col(f"`{port_col}`").cast(T.IntegerType()))
+
+    row_count = df.count()
+    print(f"✅ Loaded {row_count:,} raw flows from {df.select('Source_Folder').distinct().count()} captures")
+
+    # Sample if requested
+    if Config.DATA_SAMPLE_FRACTION < 1.0:
+        df = df.sample(False, Config.DATA_SAMPLE_FRACTION, seed=Config.RANDOM_STATE)
+        sampled_count = df.count()
+        print(f"📊 Sampled down to {sampled_count:,} rows ({Config.DATA_SAMPLE_FRACTION * 100:.1f}%)")
+
     return df
 
 
-def get_combined_label_column(label_col_name, detailed_label_col_name):
+# ============================================================================
+# LABEL PARSING FUNCTIONS
+# ============================================================================
+
+def get_combined_label_column(label_col: str = "label", detailed_col: str = "detailed-label"):
     """
-    Combine label and detailed-label columns (mimics Stage 2 approach).
-    Returns a Column expression with both columns concatenated.
-    """
-    label_col = F.coalesce(F.col(label_col_name), F.lit(''))
-    detailed_col = F.coalesce(F.col(detailed_label_col_name), F.lit(''))
-    return F.lower(F.concat(label_col, F.lit(' '), detailed_col))
-
-
-def parse_binary_label(combined_column_expr):
-    """
-    Parse binary label (Benign/Malicious) from detailed-label column.
-    Returns a Column expression for use in withColumn.
-    
-    FIXED VERSION:
-    - Properly handles NULL/empty values
-    - Explicitly checks for 'benign' keyword
-    - Returns 'Unknown' for unparseable values
-    
-    Args:
-        column_name: String name of the column (e.g., 'detailed-label')
-        
-    Returns:
-        Column: 'Benign', 'Malicious', or None (for NULL/empty)
-        :param combined_column_expr:
-    """
-    col_ref = combined_column_expr
-
-    return F.when(
-        col_ref.isNull() | (F.trim(col_ref) == '') | (col_ref == '-'),
-        F.lit(None)  # ✅ Keep NULL as NULL instead of forcing to 'Benign'
-    ).when(
-        F.lower(col_ref).contains('malicious'),
-        F.lit('Malicious')
-    ).when(
-        F.lower(col_ref).contains('benign'),
-        F.lit('Benign')
-    ).otherwise(
-        F.lit('Unknown')  # ✅ For unparseable values
-    )
-
-
-def parse_attack_type(combined_column_expr):
-    """
-    Extract attack type from detailed-label column.
-    Returns a Column expression for use in withColumn.
-
-    FIXED VERSION:
-    - Malware families are NOT attack types - return 'Malware' for them
-    - Reordered conditions so generic 'attack' comes LAST
-    - Consistent lowercase comparisons
-    - Better NULL handling
+    Get combined label column (prefers detailed-label over label).
 
     Args:
-        combined_column_expr: Column expression (result of get_combined_label_column)
+        label_col: Name of label column
+        detailed_col: Name of detailed-label column
 
     Returns:
-        Column: Attack type or 'Benign' or None
+        Spark Column with combined label
     """
-    col_ref = combined_column_expr
-    detailed_lower = F.lower(col_ref)
-
     return F.when(
-        col_ref.isNull() | (F.trim(col_ref) == '') | (F.lower(col_ref) == '-'),
-        F.lit(None)  # ✅ NULL for missing data
-    ).when(
-        detailed_lower.contains('benign'),
-        F.lit('Benign')
-    ).when(
-        # ✅ CRITICAL FIX: Check for malware family names FIRST and return 'Malware'
-        detailed_lower.contains('mirai') |
-        detailed_lower.contains('okiru') |
-        detailed_lower.contains('torii') |
-        detailed_lower.contains('kenjiro') |
-        detailed_lower.contains('gagfyt') |
-        detailed_lower.contains('muhstik') |
-        detailed_lower.contains('hajime') |
-        detailed_lower.contains('hide and seek') |
-        detailed_lower.contains('hakai') |
-        detailed_lower.contains('ircbot') |
-        detailed_lower.contains('trojan'),
-        F.lit('Malware')  # ✅ Generic label for flows with family names
-    ).when(
-        # Specific attacks BEFORE generic 'attack' check
-        detailed_lower.contains('portscan') | detailed_lower.contains('partofahorizontalportscan'),
-        F.lit('PortScan')
-    ).when(
-        detailed_lower.contains('ddos'),
-        F.lit('DDoS')
-    ).when(
-        detailed_lower.contains('c&c') | detailed_lower.contains('c2'),
-        F.lit('C&C')
-    ).when(
-        detailed_lower.contains('filedownload') | detailed_lower.contains('file download'),
-        F.lit('FileDownload')
-    ).when(
-        detailed_lower.contains('attack'),  # ✅ MOVED TO END - generic catch-all
-        F.lit('Attack')
-    ).otherwise(
-        F.lit('Unknown')  # ✅ For unparseable malicious traffic
-    )
+        F.col(f"`{detailed_col}`").isNotNull() & (F.col(f"`{detailed_col}`") != ""),
+        F.col(f"`{detailed_col}`")
+    ).otherwise(F.col(label_col))
 
 
-def get_malware_family_udf():
+def parse_binary_label(combined_col):
     """
-    Create UDF to map Source_Folder to malware family.
-    Uses Config.FILENAME_TO_FAMILY_MAP.
-    
+    Parse binary label (Benign vs Malicious) from combined label column.
+
+    Args:
+        combined_col: Spark Column with combined label
+
     Returns:
-        UDF function
+        Spark Column with binary label
     """
-    from pyspark.sql.types import StringType
-
-    family_map = Config.FILENAME_TO_FAMILY_MAP
-
-    def lookup_family(source_folder):
-        # ✅ Return None instead of 'Unknown' for missing mappings
-        return family_map.get(source_folder, None)
-
-    return F.udf(lookup_family, StringType())
+    return F.when(
+        combined_col.rlike("(?i)benign"),
+        F.lit("Benign")
+    ).otherwise(F.lit("Malicious"))
 
 
-def save_json_report(data, filepath):
+def parse_attack_type(combined_col):
     """
-    Save analysis results as JSON file.
-    
+    Parse attack type (multiclass) from combined label column.
+
+    Args:
+        combined_col: Spark Column with combined label
+
+    Returns:
+        Spark Column with attack type
+    """
+    return F.when(
+        combined_col.rlike("(?i)benign"),
+        F.lit("Benign")
+    ).when(
+        combined_col.rlike("(?i)ddos"),
+        F.lit("DDoS")
+    ).when(
+        combined_col.rlike("(?i)dos"),
+        F.lit("DoS")
+    ).when(
+        combined_col.rlike("(?i)scan"),
+        F.lit("PortScan")
+    ).when(
+        combined_col.rlike("(?i)c&c"),
+        F.lit("C&C")
+    ).when(
+        combined_col.rlike("(?i)okiru|(?i)partialflows"),
+        F.lit("PartialTraffic")
+    ).when(
+        combined_col.rlike("(?i)filedownload"),
+        F.lit("FileDownload")
+    ).otherwise(F.lit("Attack"))
+
+
+def parse_malware_family(combined_col):
+    """
+    Parse malware family from combined label column.
+
+    Args:
+        combined_col: Spark Column with combined label
+
+    Returns:
+        Spark Column with malware family
+    """
+    return F.when(
+        combined_col.rlike("(?i)benign"),
+        F.lit("Benign")
+    ).when(
+        combined_col.rlike("(?i)mirai"),
+        F.lit("Mirai")
+    ).when(
+        combined_col.rlike("(?i)torii"),
+        F.lit("Torii")
+    ).when(
+        combined_col.rlike("(?i)gagfyt|(?i)gafgyt"),
+        F.lit("Gagfyt")
+    ).when(
+        combined_col.rlike("(?i)hajime"),
+        F.lit("Hajime")
+    ).when(
+        combined_col.rlike("(?i)kenjiro"),
+        F.lit("Kenjiro")
+    ).when(
+        combined_col.rlike("(?i)okiru"),
+        F.lit("Okiru")
+    ).when(
+        combined_col.rlike("(?i)muhstik"),
+        F.lit("Muhstik")
+    ).when(
+        combined_col.rlike("(?i)hide"),
+        F.lit("Hide and Seek")
+    ).when(
+        combined_col.rlike("(?i)hakai"),
+        F.lit("Hakai")
+    ).when(
+        combined_col.rlike("(?i)irc"),
+        F.lit("IRCBot")
+    ).otherwise(F.lit("Unknown"))
+
+
+# ============================================================================
+# FEATURE EXTRACTION
+# ============================================================================
+
+def get_numeric_columns(df: DataFrame) -> list:
+    """
+    Get list of numeric column names from DataFrame.
+
+    Args:
+        df: Spark DataFrame
+
+    Returns:
+        List of numeric column names
+    """
+    numeric_types = [
+        T.ByteType, T.ShortType, T.IntegerType, T.LongType,
+        T.FloatType, T.DoubleType, T.DecimalType
+    ]
+
+    numeric_cols = []
+    for field in df.schema.fields:
+        if any(isinstance(field.dataType, t) for t in numeric_types):
+            numeric_cols.append(field.name)
+
+    return numeric_cols
+
+
+# ============================================================================
+# REPORT SAVING
+# ============================================================================
+
+def save_json_report(data: dict, filepath: str):
+    """
+    Save dictionary as formatted JSON file.
+
     Args:
         data: Dictionary to save
         filepath: Output file path
     """
-    import json
-
+    # Ensure directory exists
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    # Convert int64 to int for JSON serialization
+    # Convert any non-serializable types
     def convert_types(obj):
-        if isinstance(obj, dict):
-            return {k: convert_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_types(item) for item in obj]
-        elif hasattr(obj, 'item'):  # numpy types
-            return obj.item()
-        else:
+        """Convert non-JSON-serializable types"""
+        if isinstance(obj, (int, float, str, bool, type(None))):
             return obj
+        elif isinstance(obj, dict):
+            return {k: convert_types(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_types(item) for item in obj]
+        else:
+            return str(obj)
 
-    data_clean = convert_types(data)
+    clean_data = convert_types(data)
 
+    # Write JSON
     with open(filepath, 'w') as f:
-        json.dump(data_clean, f, indent=2)
+        json.dump(clean_data, f, indent=2)
 
-    print(f"  ✓ Saved: {os.path.basename(filepath)}")
+    print(f"💾 Report saved to: {filepath}")
 
 
-def calculate_missing_percentage(df, column):
+def load_json_report(filepath: str) -> dict:
     """
-    Calculate percentage of missing values in a column.
-    
+    Load JSON report from file.
+
+    Args:
+        filepath: Path to JSON file
+
+    Returns:
+        Dictionary with report data
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Report not found: {filepath}")
+
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+
+    return data
+
+
+# ============================================================================
+# VALIDATION HELPERS
+# ============================================================================
+
+def validate_dataframe(df: DataFrame, name: str = "DataFrame"):
+    """
+    Validate basic DataFrame properties.
+
+    Args:
+        df: Spark DataFrame to validate
+        name: Name for logging
+    """
+    print(f"\n🔍 Validating {name}...")
+
+    row_count = df.count()
+    col_count = len(df.columns)
+
+    print(f"   Rows: {row_count:,}")
+    print(f"   Columns: {col_count}")
+
+    if row_count == 0:
+        print(f"   ⚠️  WARNING: {name} is empty!")
+
+    if col_count == 0:
+        print(f"   ⚠️  WARNING: {name} has no columns!")
+
+
+def check_required_columns(df: DataFrame, required_cols: list):
+    """
+    Check if required columns exist in DataFrame.
+
     Args:
         df: Spark DataFrame
-        column: Column name
-        
-    Returns:
-        float: Percentage of missing values (0-100)
+        required_cols: List of required column names
+
+    Raises:
+        ValueError: If any required columns are missing
     """
-    if column not in df.columns:
-        return 100.0
+    missing_cols = [c for c in required_cols if c not in df.columns]
 
-    total = df.count()
-    if total == 0:
-        return 0.0
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
 
-    missing_count = df.filter(F.col(column).isNull()).count()
-
-    return round((missing_count / total) * 100, 2)
+    print(f"✅ All required columns present: {required_cols}")
 
 
-def get_class_distribution(df, column):
+# ============================================================================
+# STATISTICS HELPERS
+# ============================================================================
+
+def compute_class_distribution(df: DataFrame, label_col: str) -> dict:
     """
-    Get distribution of values in a column.
-    
+    Compute class distribution for a label column.
+
     Args:
         df: Spark DataFrame
-        column: Column name
-        
-    Returns:
-        dict: {value: count} dictionary
-    """
-    if column not in df.columns:
-        return {}
+        label_col: Name of label column
 
-    distribution = df.groupBy(column).count().collect()
-    return {row[column]: int(row['count']) for row in distribution}
+    Returns:
+        Dictionary mapping class labels to counts
+    """
+    class_counts = df.groupBy(label_col).count().collect()
+    distribution = {row[label_col]: int(row['count']) for row in class_counts}
+
+    return distribution
+
+
+def compute_missing_percentage(df: DataFrame, columns: list = None) -> dict:
+    """
+    Compute percentage of missing values per column.
+
+    Args:
+        df: Spark DataFrame
+        columns: List of columns to check (None = all columns)
+
+    Returns:
+        Dictionary mapping column names to missing percentages
+    """
+    if columns is None:
+        columns = df.columns
+
+    total_rows = df.count()
+
+    missing_pcts = {}
+    for col in columns:
+        null_count = df.filter(F.col(col).isNull()).count()
+        missing_pct = (null_count / total_rows * 100) if total_rows > 0 else 0
+        missing_pcts[col] = round(missing_pct, 2)
+
+    return missing_pcts
+
+
+# ============================================================================
+# PRINTING HELPERS
+# ============================================================================
+
+def print_dict_summary(data: dict, title: str = "Summary", max_items: int = 10):
+    """
+    Pretty print a dictionary summary.
+
+    Args:
+        data: Dictionary to print
+        title: Title for the summary
+        max_items: Maximum number of items to show
+    """
+    print(f"\n{title}:")
+
+    items = list(data.items())
+
+    # Sort by value if numeric
+    try:
+        items = sorted(items, key=lambda x: x[1], reverse=True)
+    except:
+        pass
+
+    for i, (key, value) in enumerate(items[:max_items]):
+        if isinstance(value, float):
+            print(f"   {key}: {value:.2f}")
+        elif isinstance(value, int):
+            print(f"   {key}: {value:,}")
+        else:
+            print(f"   {key}: {value}")
+
+    if len(items) > max_items:
+        print(f"   ... and {len(items) - max_items} more")

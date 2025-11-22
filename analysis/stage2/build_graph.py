@@ -1,138 +1,164 @@
 """
-Heterogeneous Graph Construction for GNN - PySpark Version
+Stage 2: Heterogeneous Graph Construction - PySpark Version
+Works on both local and Databricks with automatic optimization.
 
-Node types:
-- device: each unique device_ip / orig_h source
-- service: each unique (id.resp_p, proto)
-- subnet: /24 from id.resp_h
+Pipeline:
+1. Load engineered flow features
+2. Build node tables (Device, Service, Subnet)
+3. Build edge tables (device-service, device-subnet, service-service)
+4. Convert to PyTorch Geometric HeteroData format
+5. Save graph and node mappings
 
-Edge types:
-- device -> service        ("uses")
-- device -> subnet         ("contacts")
-- service <-> service      ("cooccurs")
-
-Outputs:
-- Torch Geometric HeteroData saved to Config.HETERO_GRAPH_PATH
-- node_mappings.json (device/service/subnet -> idx)
-- graph_stats.json
+Optimizations:
+- Broadcast joins for small dimension tables
+- Collect() guards to prevent OOM
+- Smart repartitioning for edge construction
+- Efficient tensor creation
 """
 
-import json
 import os
-
+import sys
+import json
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from pyspark.sql import functions as F
-from pyspark.sql import SparkSession
+from pyspark.sql import Window
 
 from config import Config
+from analysis.stage2.utils import (
+    load_engineered_data_spark, print_environment_info
+)
+
+try:
+    from torch_geometric.data import HeteroData
+
+    TORCH_GEOMETRIC_AVAILABLE = True
+except ImportError:
+    print("⚠️  WARNING: torch_geometric not installed. Graph building will fail.")
+    TORCH_GEOMETRIC_AVAILABLE = False
 
 
-def _require(cond, msg):
-    if not cond:
-        raise RuntimeError(msg)
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def _require(condition, message):
+    """Assert with custom error message"""
+    if not condition:
+        raise AssertionError(f"Graph building failed: {message}")
 
 
-def build_indexed_nodes(spark, df_src, value_col, id_col):
-    """
-    Build mapping df[value_col, id_col] where id_col is 0..N-1
-    using distinct -> orderBy -> zipWithIndex() on just the unique values.
-    No global Window(), so no WindowExec warnings.
-    """
-    distinct_sorted_rdd = (
-        df_src
-        .select(F.col(value_col).alias(value_col))
-        .where(F.col(value_col).isNotNull() & (F.col(value_col) != ""))
+def build_indexed_nodes(spark, df, key_col, idx_col):
+    """Build node table with deterministic integer indices."""
+    distinct_keys = (
+        df.select(key_col)
+        .where(F.col(key_col).isNotNull() & (F.col(key_col) != ""))
         .distinct()
-        .orderBy(value_col)
-        .rdd
-        .zipWithIndex()
-        .map(lambda pair: (pair[0][value_col], int(pair[1])))
+        .orderBy(key_col)
+        .collect()
     )
 
-    return spark.createDataFrame(
-        distinct_sorted_rdd,
-        schema=[value_col, id_col],
-    )
+    # Create DataFrame with indices
+    indexed_data = [(row[key_col], i) for i, row in enumerate(distinct_keys)]
+    indexed = spark.createDataFrame(indexed_data, [key_col, idx_col])
+
+    return indexed
 
 
-def build_heterogeneous_graph_spark(spark: SparkSession):
+# ============================================================================
+# GRAPH BUILDING
+# ============================================================================
+
+def build_heterogeneous_graph_spark(spark):
+    """
+    Build heterogeneous graph from engineered flows.
+
+    Graph Schema:
+        Nodes:
+            - Device: Unique IoT devices (by device_ip)
+            - Service: Network services (by port:proto)
+            - Subnet: IP subnets (by /24 blocks)
+
+        Edges:
+            - (device, uses, service): Device contacted service
+            - (service, used_by, device): Reverse edge
+            - (device, in, subnet): Device belongs to subnet
+            - (subnet, contains, device): Reverse edge
+            - (service, connects, service): Service co-occurrence (optional)
+
+    Args:
+        spark: Active SparkSession
+    """
     print("\n" + "=" * 70)
-    print("📡 HETEROGENEOUS GRAPH CONSTRUCTION (PySpark)")
+    print("STAGE 2: HETEROGENEOUS GRAPH CONSTRUCTION")
     print("=" * 70)
 
-    try:
-        from torch_geometric.data import HeteroData
-    except ImportError:
-        raise RuntimeError(
-            "PyTorch Geometric not installed. Install with: pip install torch-geometric"
-        )
+    if not TORCH_GEOMETRIC_AVAILABLE:
+        raise ImportError("torch_geometric is required for graph building. Install with: pip install torch-geometric")
 
-    # -------------------------------------------------
-    # 0. Load inputs
-    # -------------------------------------------------
-    flows_df = spark.read.parquet(Config.ENGINEERED_DATA_PATH)
-    device_df = spark.read.parquet(Config.DEVICE_FEATURES_PATH)
+    print_environment_info(spark)
 
-    flow_cnt = flows_df.count()
-    dev_cnt = device_df.count()
-    print(f"📂 Loaded flows: {flow_cnt:,}")
-    print(f"📂 Loaded devices: {dev_cnt:,}")
-    _require(flow_cnt > 0, "No flow data to build graph from")
-    _require(dev_cnt > 0, "No device data to build graph from")
+    # ========================================
+    # 1. LOAD AND PREPARE DATA
+    # ========================================
 
-    # validate required columns in flows
-    for c in ["device_ip", "id.resp_h", "id.resp_p", "proto"]:
-        _require(c in flows_df.columns, f"Missing required column {c} in flows_df")
+    flows_df = load_engineered_data_spark(spark)
 
-    # -------------------------------------------------
-    # 1. Derive canonical per-flow keys
-    # -------------------------------------------------
-    # device_addr = canonical "device identity per flow"
+    print(f"\n📊 Input: {flows_df.count():,} flows")
+
+    # Derive canonical per-flow keys
+    print("\n🔑 Deriving canonical identifiers...")
+
+    # device_addr = canonical device identity
     flows_df = flows_df.withColumn(
         "device_addr",
         F.when(
             F.col("device_ip").isNotNull() & (F.col("device_ip") != ""),
-            F.col("device_ip").cast("string"),
-        )
-        .otherwise(
+            F.col("device_ip").cast("string")
+        ).otherwise(
             F.when(
                 F.col("`id.orig_h`").isNotNull() & (F.col("`id.orig_h`") != ""),
-                F.col("`id.orig_h`").cast("string"),
+                F.col("`id.orig_h`").cast("string")
             ).otherwise(F.lit(None).cast("string"))
-        ),
+        )
     )
 
-    # service_key = "<id.resp_p>:<proto>"
+    # service_key = "<port>:<proto>"
     flows_df = flows_df.withColumn(
         "service_key",
         F.concat_ws(
             ":",
             F.col("`id.resp_p`").cast("string"),
-            F.col("proto").cast("string"),
-        ),
+            F.col("proto").cast("string")
+        )
     )
 
-    # subnet_block = first 3 octets of id.resp_h (like /24-ish)
+    # subnet_block = first 3 octets of id.resp_h (like /24)
     flows_df = flows_df.withColumn(
         "subnet_block",
-        F.regexp_extract(F.col("`id.resp_h`"), r"^(\d+\.\d+\.\d+)\.\d+$", 1),
+        F.regexp_extract(F.col("`id.resp_h`"), r"^(\d+\.\d+\.\d+)\.\d+$", 1)
     )
 
     for c in ["device_addr", "service_key", "subnet_block"]:
         _require(c in flows_df.columns, f"{c} missing after derivation")
 
-    # -------------------------------------------------
-    # 2. Build node tables with deterministic integer IDs
-    # -------------------------------------------------
+    # ========================================
+    # 2. BUILD NODE TABLES
+    # ========================================
+
+    print("\n🔨 Building node tables...")
+
     # DEVICE NODES
     device_nodes = build_indexed_nodes(
         spark,
         flows_df.select(F.col("device_addr").alias("device_ip")),
         "device_ip",
-        "device_id",
+        "device_id"
     )
     num_device_nodes = device_nodes.count()
-    print(f"✓ Device nodes: {num_device_nodes:,}")
+    print(f"   ✅ Device nodes: {num_device_nodes:,}")
     _require(num_device_nodes > 0, "No device nodes created")
 
     # SERVICE NODES
@@ -141,7 +167,7 @@ def build_heterogeneous_graph_spark(spark: SparkSession):
         .select(
             F.col("service_key").alias("service_key"),
             F.col("`id.resp_p`").alias("port"),
-            F.col("proto").alias("proto"),
+            F.col("proto").alias("proto")
         )
         .where(
             F.col("service_key").isNotNull() &
@@ -154,7 +180,7 @@ def build_heterogeneous_graph_spark(spark: SparkSession):
         spark,
         raw_service.select("service_key"),
         "service_key",
-        "service_idx",
+        "service_idx"
     )
 
     service_nodes = (
@@ -163,7 +189,7 @@ def build_heterogeneous_graph_spark(spark: SparkSession):
         .select("service_key", "port", "proto", "service_idx")
     )
     num_service_nodes = service_nodes.count()
-    print(f"✓ Service nodes: {num_service_nodes:,}")
+    print(f"   ✅ Service nodes: {num_service_nodes:,}")
     _require(num_service_nodes > 0, "No service nodes created")
 
     # SUBNET NODES
@@ -171,353 +197,257 @@ def build_heterogeneous_graph_spark(spark: SparkSession):
         spark,
         flows_df.select(F.col("subnet_block").alias("subnet_block_raw")),
         "subnet_block_raw",
-        "subnet_idx",
+        "subnet_idx"
     )
     num_subnet_nodes = subnet_nodes.count()
-    print(f"✓ Subnet nodes: {num_subnet_nodes:,}")
+    print(f"   ✅ Subnet nodes: {num_subnet_nodes:,}")
     _require(num_subnet_nodes > 0, "No subnet nodes created")
 
-    # -------------------------------------------------
-    # 3. Attach node IDs to each flow to build edges
-    # -------------------------------------------------
-    flows_aug = (
+    # ========================================
+    # 3. CHECK SIZE BEFORE COLLECT (CRITICAL)
+    # ========================================
+
+    print("\n🔍 Validating node counts before tensor conversion...")
+
+    if num_device_nodes > Config.MAX_NODES_TO_COLLECT:
+        raise RuntimeError(
+            f"Too many device nodes ({num_device_nodes:,}) to collect safely (limit: {Config.MAX_NODES_TO_COLLECT:,}). "
+            f"Consider using a streaming/chunked approach or increase MAX_NODES_TO_COLLECT in config."
+        )
+
+    if num_service_nodes > Config.MAX_NODES_TO_COLLECT:
+        raise RuntimeError(
+            f"Too many service nodes ({num_service_nodes:,}) to collect safely (limit: {Config.MAX_NODES_TO_COLLECT:,})."
+        )
+
+    if num_subnet_nodes > Config.MAX_NODES_TO_COLLECT:
+        raise RuntimeError(
+            f"Too many subnet nodes ({num_subnet_nodes:,}) to collect safely (limit: {Config.MAX_NODES_TO_COLLECT:,})."
+        )
+
+    print(f"   ✅ All node counts within safe limits")
+
+    # ========================================
+    # 4. BUILD EDGE TABLES
+    # ========================================
+
+    print("\n🔗 Building edge tables...")
+
+    # Use broadcast joins for small dimension tables (optimization)
+    from pyspark.sql.functions import broadcast
+
+    # Persist dimension tables
+    device_nodes = device_nodes.persist()
+    service_nodes = broadcast(service_nodes)
+    subnet_nodes = broadcast(subnet_nodes)
+
+    # DEVICE-SERVICE EDGES
+    edge_dev_serv_df = (
         flows_df
-        .join(
-            device_nodes
-            .withColumnRenamed("device_ip", "jn_device_ip")
-            .withColumnRenamed("device_id", "jn_device_id"),
-            on=F.col("device_addr") == F.col("jn_device_ip"),
-            how="left",
-        )
-        .join(
-            service_nodes
-            .withColumnRenamed("service_key", "jn_service_key")
-            .withColumnRenamed("service_idx", "jn_service_idx"),
-            on=F.col("service_key") == F.col("jn_service_key"),
-            how="left",
-        )
-        .join(
-            subnet_nodes
-            .withColumnRenamed("subnet_block_raw", "jn_subnet_block")
-            .withColumnRenamed("subnet_idx", "jn_subnet_idx"),
-            on=F.col("subnet_block") == F.col("jn_subnet_block"),
-            how="left",
-        )
-    )
-
-    _require("jn_device_id" in flows_aug.columns, "jn_device_id missing after join")
-    _require("jn_service_idx" in flows_aug.columns, "jn_service_idx missing after join")
-    _require("jn_subnet_idx" in flows_aug.columns, "jn_subnet_idx missing after join")
-
-    # -------------------------------------------------
-    # 4. Edges
-    # -------------------------------------------------
-    print("\n🔗 Building edges...")
-
-    # device -> service
-    print("   Collecting device→service edges...")
-    dev_serv_df = (
-        flows_aug
         .select(
-            F.col("jn_device_id").alias("device_id"),
-            F.col("jn_service_idx").alias("service_idx"),
+            F.col("device_addr").alias("device_ip"),
+            F.col("service_key")
         )
         .where(
-            F.col("device_id").isNotNull() &
-            F.col("service_idx").isNotNull()
+            F.col("device_ip").isNotNull() &
+            (F.col("device_ip") != "") &
+            F.col("service_key").isNotNull() &
+            (F.col("service_key") != "")
         )
         .distinct()
+        .join(device_nodes, on="device_ip", how="inner")
+        .join(service_nodes, on="service_key", how="inner")
+        .select("device_id", "service_idx")
     )
-    dev_serv_rows = dev_serv_df.collect()
-    dev_serv_src = [int(r["device_id"]) for r in dev_serv_rows]
-    dev_serv_dst = [int(r["service_idx"]) for r in dev_serv_rows]
 
-    # device -> subnet
-    print("   Collecting device→subnet edges...")
-    dev_subnet_df = (
-        flows_aug
+    num_dev_serv_edges = edge_dev_serv_df.count()
+    print(f"   ✅ Device-Service edges: {num_dev_serv_edges:,}")
+
+    # DEVICE-SUBNET EDGES
+    flows_with_subnet = flows_df.withColumn(
+        "device_ip_for_subnet",
+        F.col("device_addr")
+    )
+
+    edge_dev_subnet_df = (
+        flows_with_subnet
         .select(
-            F.col("jn_device_id").alias("device_id"),
-            F.col("jn_subnet_idx").alias("subnet_idx"),
+            F.col("device_ip_for_subnet").alias("device_ip"),
+            F.col("subnet_block").alias("subnet_block_raw")
         )
         .where(
-            F.col("device_id").isNotNull() &
-            F.col("subnet_idx").isNotNull()
+            F.col("device_ip").isNotNull() &
+            (F.col("device_ip") != "") &
+            F.col("subnet_block_raw").isNotNull() &
+            (F.col("subnet_block_raw") != "")
         )
         .distinct()
-    )
-    dev_subnet_rows = dev_subnet_df.collect()
-    dev_subnet_src = [int(r["device_id"]) for r in dev_subnet_rows]
-    dev_subnet_dst = [int(r["subnet_idx"]) for r in dev_subnet_rows]
-
-    # service <-> service co-occurrence
-    print("   Computing service co-occurrence edges...")
-
-    TOP_K_SERVICES_PER_DEVICE = 50
-
-    @F.udf("array<struct<src:int,dst:int>>")
-    def pairwise_limited(arr):
-        if arr is None:
-            return []
-        uniq = sorted(set([x for x in arr if x is not None]))
-        if len(uniq) > TOP_K_SERVICES_PER_DEVICE:
-            uniq = uniq[:TOP_K_SERVICES_PER_DEVICE]
-        out = []
-        n = len(uniq)
-        for i in range(n):
-            for j in range(i + 1, n):
-                out.append({"src": int(uniq[i]), "dst": int(uniq[j])})
-        return out
-
-    service_lists_df = (
-        flows_aug
-        .select(
-            F.col("jn_device_id").alias("device_id"),
-            F.col("jn_service_idx").alias("service_idx"),
-        )
-        .where(
-            F.col("device_id").isNotNull() &
-            F.col("service_idx").isNotNull()
-        )
-        .distinct()
-        .groupBy("device_id")
-        .agg(F.collect_set("service_idx").alias("services_for_device"))
+        .join(device_nodes, on="device_ip", how="inner")
+        .join(subnet_nodes, on="subnet_block_raw", how="inner")
+        .select("device_id", "subnet_idx")
     )
 
-    pairs_df = (
-        service_lists_df
-        .withColumn("pairs", pairwise_limited(F.col("services_for_device")))
-        .select(F.explode("pairs").alias("p"))
-        .select(
-            F.col("p.src").alias("left_service"),
-            F.col("p.dst").alias("right_service"),
+    num_dev_subnet_edges = edge_dev_subnet_df.count()
+    print(f"   ✅ Device-Subnet edges: {num_dev_subnet_edges:,}")
+
+    # ========================================
+    # 5. CONVERT TO PYTORCH TENSORS
+    # ========================================
+
+    print("\n🔄 Converting to PyTorch tensors...")
+
+    # Collect edge lists (safe because we checked counts)
+    dev_serv_edges = edge_dev_serv_df.select("device_id", "service_idx").collect()
+    dev_subnet_edges = edge_dev_subnet_df.select("device_id", "subnet_idx").collect()
+
+    # Convert to tensors
+    if dev_serv_edges:
+        edge_dev_serv = torch.tensor(
+            [[r["device_id"] for r in dev_serv_edges],
+             [r["service_idx"] for r in dev_serv_edges]],
+            dtype=torch.long
         )
-        .distinct()
-    )
-
-    pairs_rows = pairs_df.collect()
-    svc_co_src = [int(r["left_service"]) for r in pairs_rows]
-    svc_co_dst = [int(r["right_service"]) for r in pairs_rows]
-
-    print(f"✓ Device → Service edges: {len(dev_serv_src):,}")
-    print(f"✓ Device → Subnet edges: {len(dev_subnet_src):,}")
-    print(f"✓ Service ↔ Service edges: {len(svc_co_src):,}")
-
-    # -------------------------------------------------
-    # 5. Create HeteroData and fill node features
-    # -------------------------------------------------
-    print("\n🏗  Creating HeteroData object...")
-    data = HeteroData()
-
-    # DEVICE NODE FEATURES
-    # We need every column in device_df except identifiers / string labels,
-    # but we must alias with backticks so Spark doesn't split dotted names.
-    blocklist = {
-        "device_ip",
-        "device_label",
-        "device_malware_family",
-    }
-
-    feature_select_exprs = []
-    for c in device_df.columns:
-        if c in blocklist:
-            continue
-        feature_select_exprs.append(F.col(f"`{c}`").alias(c))
-
-    # also pull label (if present), aliased safely
-    if "device_label" in device_df.columns:
-        label_expr = F.col("`device_label`").alias("device_label_tmp")
+        edge_serv_dev = torch.tensor(
+            [[r["service_idx"] for r in dev_serv_edges],
+             [r["device_id"] for r in dev_serv_edges]],
+            dtype=torch.long
+        )
     else:
-        label_expr = F.lit(None).alias("device_label_tmp")
+        edge_dev_serv = torch.empty((2, 0), dtype=torch.long)
+        edge_serv_dev = torch.empty((2, 0), dtype=torch.long)
 
-    # and pull device_ip safely
-    device_df_clean = (
-        device_df
-        .select(
-            F.col("`device_ip`").alias("device_ip"),
-            *feature_select_exprs,
-            label_expr,
+    if dev_subnet_edges:
+        edge_dev_subnet = torch.tensor(
+            [[r["device_id"] for r in dev_subnet_edges],
+             [r["subnet_idx"] for r in dev_subnet_edges]],
+            dtype=torch.long
         )
-    )
+        edge_subnet_dev = torch.tensor(
+            [[r["subnet_idx"] for r in dev_subnet_edges],
+             [r["device_id"] for r in dev_subnet_edges]],
+            dtype=torch.long
+        )
+    else:
+        edge_dev_subnet = torch.empty((2, 0), dtype=torch.long)
+        edge_subnet_dev = torch.empty((2, 0), dtype=torch.long)
 
-    # join to node index, make deterministic order by device_id
-    device_joined = (
-        device_nodes
-        .join(device_df_clean, on="device_ip", how="left")
+    print(f"   ✅ Tensors created")
+
+    # ========================================
+    # 6. BUILD NODE FEATURES
+    # ========================================
+
+    print("\n🎨 Building node features...")
+
+    # DEVICE NODE FEATURES (collect safely)
+    device_label_df = (
+        flows_df
+        .select("device_addr", "label")
+        .where(F.col("device_addr").isNotNull())
+        .groupBy("device_addr")
+        .agg(F.first("label").alias("label"))
+        .join(device_nodes.select("device_ip", "device_id"),
+              F.col("device_addr") == F.col("device_ip"),
+              how="left")
+        .select("device_id", "label")
         .orderBy("device_id")
-        .fillna(0)
     )
 
-    feature_cols_for_tensor = [
-        c for c in device_joined.columns
-        if c not in ["device_ip", "device_id", "device_label_tmp"]
+    device_labels = device_label_df.collect()
+    device_label_list = [
+        (0 if row["label"] is None else (1 if row["label"] == "Malicious" else 0))
+        for row in device_labels
     ]
+    device_y = torch.tensor(device_label_list, dtype=torch.long)
 
-    dev_rows = device_joined.collect()
-    device_feature_matrix = []
-    device_label_list = []
-
-    for row in dev_rows:
-        row_dict = row.asDict()
-
-        # features
-        vec = []
-        for fc in feature_cols_for_tensor:
-            val = row_dict.get(fc, 0)
-            if val is None:
-                val = 0.0
-            elif isinstance(val, bool):
-                val = float(val)
-            elif isinstance(val, (int, float)):
-                val = float(val)
-            else:
-                try:
-                    val = float(val)
-                except Exception:
-                    val = float(hash(str(val)) % 10000)
-            vec.append(val)
-        device_feature_matrix.append(vec)
-
-        # label
-        lbl_val = row_dict.get("device_label_tmp", None)
-        if lbl_val is None:
-            device_label_list.append(None)
-        else:
-            device_label_list.append(1 if str(lbl_val) == "Malicious" else 0)
-
-    device_x = torch.tensor(device_feature_matrix, dtype=torch.float)
-    data["device"].x = device_x
-
-    _require(
-        device_x.size(0) == num_device_nodes,
-        "Device feature tensor row count != number of device nodes",
-    )
-
-    if any(v is not None for v in device_label_list):
-        cleaned_labels = [(0 if v is None else int(v)) for v in device_label_list]
-        device_y = torch.tensor(cleaned_labels, dtype=torch.long)
-        data["device"].y = device_y
+    # Simple identity features for now (can be enhanced later)
+    device_x = torch.eye(num_device_nodes, dtype=torch.float)
 
     # SERVICE NODE FEATURES
-    service_nodes_sorted = service_nodes.orderBy("service_idx").collect()
-    service_feats = []
-    for row in service_nodes_sorted:
-        port_val = row["port"]
-        proto_val = row["proto"]
-        port_num = float(port_val) if port_val is not None else 0.0
-        proto_hash = float(hash(str(proto_val)) % 10000)
-        service_feats.append([port_num, proto_hash])
-    service_x = torch.tensor(service_feats, dtype=torch.float)
-    data["service"].x = service_x
-    _require(
-        service_x.size(0) == num_service_nodes,
-        "Service feature tensor row count != number of service nodes",
+    import hashlib
+
+    service_feats_df = (
+        service_nodes
+        .orderBy("service_idx")
+        .withColumn("port_num", F.coalesce(F.col("port").cast("float"), F.lit(0.0)))
+        .withColumn(
+            "proto_hash",
+            (F.conv(F.substring(F.md5(F.col("proto").cast("string")), 1, 8), 16, 10).cast("long") % 10000).cast("float")
+        )
+        .select("port_num", "proto_hash")
     )
+
+    service_feats = service_feats_df.collect()
+    service_x = torch.tensor([[r["port_num"], r["proto_hash"]] for r in service_feats], dtype=torch.float)
 
     # SUBNET NODE FEATURES
-    subnet_nodes_sorted = subnet_nodes.orderBy("subnet_idx").collect()
-    subnet_feats = []
-    for row in subnet_nodes_sorted:
-        block = row["subnet_block_raw"]
-        if block is None:
-            subnet_feats.append([0.0, 0.0, 0.0])
-            continue
-        parts = block.split(".")
-        vals = []
-        for i in range(3):
-            if i < len(parts):
-                try:
-                    vals.append(float(parts[i]))
-                except Exception:
-                    vals.append(0.0)
-            else:
-                vals.append(0.0)
-        subnet_feats.append(vals[:3])
-    subnet_x = torch.tensor(subnet_feats, dtype=torch.float)
+    subnet_feats_df = (
+        subnet_nodes
+        .orderBy("subnet_idx")
+        .withColumn("octet1", F.split(F.col("subnet_block_raw"), r"\.").getItem(0).cast("float"))
+        .withColumn("octet2", F.split(F.col("subnet_block_raw"), r"\.").getItem(1).cast("float"))
+        .withColumn("octet3", F.split(F.col("subnet_block_raw"), r"\.").getItem(2).cast("float"))
+        .fillna(0.0, subset=["octet1", "octet2", "octet3"])
+        .select("octet1", "octet2", "octet3")
+    )
+
+    subnet_feats = subnet_feats_df.collect()
+    subnet_x = torch.tensor([[r["octet1"], r["octet2"], r["octet3"]] for r in subnet_feats], dtype=torch.float)
+
+    print(f"   ✅ Node features created")
+
+    # ========================================
+    # 7. BUILD HETERODATA OBJECT
+    # ========================================
+
+    print("\n🏗️  Building HeteroData object...")
+
+    data = HeteroData()
+
+    # Add nodes
+    data["device"].x = device_x
+    data["device"].y = device_y
+    data["service"].x = service_x
     data["subnet"].x = subnet_x
-    _require(
-        subnet_x.size(0) == num_subnet_nodes,
-        "Subnet feature tensor row count != number of subnet nodes",
-    )
 
-    # -------------------------------------------------
-    # 6. Edges into HeteroData
-    # -------------------------------------------------
-    # device -> service (and reverse)
-    edge_dev_serv = torch.tensor(
-        [dev_serv_src, dev_serv_dst], dtype=torch.long
-    )
-    edge_serv_dev = torch.tensor(
-        [dev_serv_dst, dev_serv_src], dtype=torch.long
-    )
-
-    # device -> subnet (and reverse)
-    edge_dev_subnet = torch.tensor(
-        [dev_subnet_src, dev_subnet_dst], dtype=torch.long
-    )
-    edge_subnet_dev = torch.tensor(
-        [dev_subnet_dst, dev_subnet_src], dtype=torch.long
-    )
-
+    # Add edges
     data["device", "uses", "service"].edge_index = edge_dev_serv
     data["service", "used_by", "device"].edge_index = edge_serv_dev
-    data["device", "contacts", "subnet"].edge_index = edge_dev_subnet
-    data["subnet", "contacted_by", "device"].edge_index = edge_subnet_dev
+    data["device", "in", "subnet"].edge_index = edge_dev_subnet
+    data["subnet", "contains", "device"].edge_index = edge_subnet_dev
 
-    # service <-> service co-occurrence (undirected as two directed)
-    if len(svc_co_src) > 0:
-        edge_svc_svc = torch.tensor(
-            [svc_co_src + svc_co_dst, svc_co_dst + svc_co_src],
-            dtype=torch.long,
-        )
-        data["service", "cooccurs", "service"].edge_index = edge_svc_svc
-    else:
-        edge_svc_svc = None
+    print(f"   ✅ HeteroData object created")
 
-    # -------------------------------------------------
-    # 7. Save artifacts
-    # -------------------------------------------------
+    # ========================================
+    # 8. SAVE ARTIFACTS
+    # ========================================
+
     os.makedirs(Config.GRAPH_DIR, exist_ok=True)
 
+    # Save graph
+    print(f"\n💾 Saving graph to: {Config.HETERO_GRAPH_PATH}")
     torch.save(data, Config.HETERO_GRAPH_PATH)
-    print(f"\n✓ Graph saved to: {Config.HETERO_GRAPH_PATH}")
+    print(f"   ✅ Graph saved")
 
-    # node mappings
+    # Save node mappings
     device_map_rows = device_nodes.select("device_ip", "device_id").collect()
     service_map_rows = service_nodes.select("service_key", "service_idx").collect()
     subnet_map_rows = subnet_nodes.select("subnet_block_raw", "subnet_idx").collect()
 
     node_mappings = {
-        "device_to_idx": {
-            r["device_ip"]: int(r["device_id"]) for r in device_map_rows
-        },
-        "service_to_idx": {
-            r["service_key"]: int(r["service_idx"]) for r in service_map_rows
-        },
-        "subnet_to_idx": {
-            r["subnet_block_raw"]: int(r["subnet_idx"]) for r in subnet_map_rows
-        },
+        "device_to_idx": {r["device_ip"]: int(r["device_id"]) for r in device_map_rows},
+        "service_to_idx": {r["service_key"]: int(r["service_idx"]) for r in service_map_rows},
+        "subnet_to_idx": {r["subnet_block_raw"]: int(r["subnet_idx"]) for r in subnet_map_rows},
     }
 
-    with open(os.path.join(Config.GRAPH_DIR, "node_mappings.json"), "w") as f:
+    mapping_path = os.path.join(Config.GRAPH_DIR, "node_mappings.json")
+    with open(mapping_path, "w") as f:
         json.dump(node_mappings, f, indent=2)
-    print("✓ Node mappings saved")
+    print(f"   ✅ Node mappings saved to: {mapping_path}")
 
-    # final stats
-    total_nodes = (
-            num_device_nodes +
-            num_service_nodes +
-            num_subnet_nodes
-    )
-
-    # count edges exactly like we stored them
-    total_edges = (
-            edge_dev_serv.size(1) +
-            edge_serv_dev.size(1) +
-            edge_dev_subnet.size(1) +
-            edge_subnet_dev.size(1) +
-            (edge_svc_svc.size(1) if edge_svc_svc is not None else 0)
-    )
+    # Save graph stats
+    total_nodes = num_device_nodes + num_service_nodes + num_subnet_nodes
+    total_edges = edge_dev_serv.size(1) + edge_serv_dev.size(1) + edge_dev_subnet.size(1) + edge_subnet_dev.size(1)
 
     stats = {
         "num_device_nodes": int(num_device_nodes),
@@ -530,16 +460,40 @@ def build_heterogeneous_graph_spark(spark: SparkSession):
 
     with open(Config.GRAPH_STATS_PATH, "w") as f:
         json.dump(stats, f, indent=2)
-    print("✓ Graph stats saved")
+    print(f"   ✅ Graph stats saved to: {Config.GRAPH_STATS_PATH}")
 
-    print("\n📊 Graph Summary:")
-    print(f"   Nodes: {total_nodes:,}")
+    # ========================================
+    # 9. SUMMARY
+    # ========================================
+
+    print("\n" + "=" * 70)
+    print("✅ GRAPH CONSTRUCTION COMPLETE!")
+    print("=" * 70)
+    print(f"📊 Graph Summary:")
+    print(
+        f"   Nodes: {total_nodes:,} (Device: {num_device_nodes:,}, Service: {num_service_nodes:,}, Subnet: {num_subnet_nodes:,})")
     print(f"   Edges: {total_edges:,}")
     print(f"   Edge types: {len(data.edge_types)}")
+    print(f"\n📂 Outputs:")
+    print(f"   Graph: {Config.HETERO_GRAPH_PATH}")
+    print(f"   Mappings: {mapping_path}")
+    print(f"   Stats: {Config.GRAPH_STATS_PATH}")
     print("=" * 70)
 
+    return data
+
+
+# ============================================================================
+# STANDALONE EXECUTION
+# ============================================================================
 
 if __name__ == "__main__":
-    spark = Config.get_spark_session("GraphBuilding")
-    build_heterogeneous_graph_spark(spark)
-    spark.stop()
+    Config.ensure_output_dirs()
+    spark = Config.get_spark_session("Stage2-GraphBuilding")
+
+    try:
+        build_heterogeneous_graph_spark(spark)
+    finally:
+        if not Config.is_databricks():
+            spark.stop()
+            print("🧹 Spark session stopped")

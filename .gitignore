@@ -15,3 +15,23 @@ all_python_files
 */.env
 .github
 mcp/.gemini/settings.json
+
+# Spark temporary files
+metastore_db/
+spark-warehouse/
+derby.log
+*.pyc
+__pycache__/
+
+# Outputs
+outputs/
+data/raw/
+data/processed/
+
+# Model checkpoints
+*.ckpt
+*.pth
+*.pt
+
+# Databricks
+.dbfs/

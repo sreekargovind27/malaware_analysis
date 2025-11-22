@@ -1,173 +1,287 @@
 """
-Graph Structure Analysis for GNN Feasibility (PySpark).
-UPDATED: Includes analysis for both a simple IP-to-IP graph and a
-more robust heterogeneous graph (Device-Service-Subnet) to provide a
-clear recommendation for GNN modeling.
-FIXED: Replaced non-standard 'combinations' function with a robust self-join.
+Stage 1: Graph Structure Analysis - PySpark Version
+Works on both local and Databricks.
+
+Analyzes graph structure feasibility for GNN models:
+- Device, Service, Subnet node counts
+- Edge connectivity (device-service, device-subnet)
+- Graph density and connectivity
+- Isolated node detection
+
+Returns feasibility assessment for GNN models (GO/WARNING/NO-GO).
 """
 
-from pyspark.sql import functions as F
-
-from .utils import get_malware_family_udf
+from pyspark.sql import DataFrame, functions as F
 
 
-def analyze_ip_to_ip_graph(df):
-    """Analyzes the simple, sparse IP-to-IP graph."""
-    print("  Approach 1: IP-to-IP Graph (Traditional)")
+def analyze_graph_structure(df: DataFrame) -> dict:
+    """
+    Analyze graph structure for GNN model feasibility.
 
-    source_ips = df.select('id_orig_h').distinct()
-    dest_ips = df.select('id_resp_h').distinct()
+    Constructs a conceptual heterogeneous graph:
+    - Nodes: Devices (by device_ip), Services (by port:proto), Subnets (by /24 blocks)
+    - Edges: device-uses-service, device-in-subnet
 
-    source_ips_renamed = source_ips.withColumnRenamed('id_orig_h', 'ip')
-    dest_ips_renamed = dest_ips.withColumnRenamed('id_resp_h', 'ip')
+    Args:
+        df: Spark DataFrame with raw IoT-23 data
 
-    all_ips = source_ips_renamed.union(dest_ips_renamed).distinct()
-    total_nodes = all_ips.count()
-    total_edges = df.filter(F.col('id_orig_h').isNotNull() & F.col('id_resp_h').isNotNull()).count()
-
-    # Simple density calculation
-    possible_edges = total_nodes * (total_nodes - 1)
-    density = total_edges / possible_edges if possible_edges > 0 else 0
-
-    print(f"    Nodes (Unique IPs): {total_nodes:,}")
-    print(f"    Edges (Connections): {total_edges:,}")
-    print(f"    Connectivity/Density: {density:.4%}")
-    print("    Assessment: ❌ TOO SPARSE (typical for IoT datasets)")
-
-    return {'nodes': total_nodes, 'edges': total_edges, 'density': density}
-
-
-def analyze_heterogeneous_graph(df):
-    """Analyzes the recommended, denser heterogeneous graph."""
-    print("\n  Approach 2: Heterogeneous Graph (RECOMMENDED)")
-
-    # 1. Define Node Sets
-    device_nodes = df.select('id_orig_h').distinct()
-    service_nodes = df.select(F.concat_ws(':', F.col('id_resp_p'), F.col('proto')).alias('service')).distinct()
-    subnet_nodes = df.withColumn(
-        'subnet', F.regexp_extract(F.col('id_resp_h'), r'^(\d+\.\d+)\..*', 1)
-    ).select('subnet').distinct()
-
-    num_devices = device_nodes.count()
-    num_services = service_nodes.count()
-    num_subnets = subnet_nodes.count()
-    total_nodes = num_devices + num_services + num_subnets
-
-    # 2. Define Edge Sets
-    # Edge: (Device) -> [uses] -> (Service)
-    device_service_edges = df.select('id_orig_h',
-                                     F.concat_ws(':', F.col('id_resp_p'), F.col('proto')).alias('service')).distinct()
-    num_device_service_edges = device_service_edges.count()
-
-    # Edge: (Device) -> [targets] -> (Subnet)
-    device_subnet_edges = df.withColumn(
-        'subnet', F.regexp_extract(F.col('id_resp_h'), r'^(\d+\.\d+)\..*', 1)
-    ).select('id_orig_h', 'subnet').distinct()
-    num_device_subnet_edges = device_subnet_edges.count()
-
-    # Edge: (Service) <-> (Service) co-occurrence
-    device_services_list = device_service_edges.groupBy('id_orig_h').agg(F.collect_set('service').alias('services'))
-
-    # ✅ FIXED: Use self-join instead of 'combinations'
-    exploded_services = device_services_list.filter(F.size('services') > 1).withColumn("service_A",
-                                                                                       F.explode("services"))
-    service_pairs = exploded_services.alias("df1").join(
-        exploded_services.alias("df2"),
-        (F.col("df1.id_orig_h") == F.col("df2.id_orig_h")) & (F.col("df1.service_A") < F.col("df2.service_A")),
-        "inner"
-    )
-    num_service_edges = service_pairs.count()
-
-    total_edges = num_device_service_edges + num_device_subnet_edges + num_service_edges
-
-    # 3. Calculate Density and other stats
-    possible_edges = num_devices * num_services + num_devices * num_subnets + (num_services * (num_services - 1) / 2)
-    density = total_edges / possible_edges if possible_edges > 0 else 0
-    avg_device_degree = total_edges / num_devices if num_devices > 0 else 0
-
-    print(f"    Nodes: {total_nodes:,} ({num_devices:,} devices + {num_services:,} services + {num_subnets:,} subnets)")
-    print(
-        f"    Edges: {total_edges:,} ({num_device_service_edges:,} device-service, {num_device_subnet_edges:,} device-subnet, etc.)")
-    print(f"    Connectivity/Density: {density:.4%}")
-    print(f"    Avg Connections per Device: {avg_device_degree:.2f}")
-    print("    Assessment: ✅ SUITABLE for GNN analysis")
-
-    return {
-        'nodes': {'total': total_nodes, 'devices': num_devices, 'services': num_services, 'subnets': num_subnets},
-        'edges': {'total': total_edges, 'device_to_service': num_device_service_edges,
-                  'device_to_subnet': num_device_subnet_edges, 'service_to_service': num_service_edges},
-        'density': density,
-        'avg_device_degree': avg_device_degree
-    }
-
-
-def analyze_graph_structure(df):
-    """Main function to analyze graph structure feasibility for GNN."""
+    Returns:
+        dict: Graph structure feasibility stats
+    """
     print("\n" + "=" * 70)
-    print("GRAPH STRUCTURE FEASIBILITY (GNN)")
+    print("GRAPH STRUCTURE ANALYSIS (GNN Feasibility)")
     print("=" * 70)
 
-    required_cols = ['id_orig_h', 'id_resp_h', 'id_resp_p', 'proto']
-    if not all(col in df.columns for col in required_cols):
-        return {
-            'feasibility': 'NO-GO',
-            'reason': f'Missing one or more required columns for graph analysis: {required_cols}'
-        }
-
-    print("  Analyzing graph structure approaches...")
-
-    # Analyze both approaches for comparison
-    ip_graph_stats = analyze_ip_to_ip_graph(df)
-    hetero_graph_stats = analyze_heterogeneous_graph(df)
-
-    # IPs per malware family (for node labeling in the heterogeneous graph)
-    print("\n  Analyzing IPs per malware family for device node labels...")
-    df_labeled = df.withColumn('malware_family', get_malware_family_udf()(F.col('Source_Folder')))
-    malicious_df = df_labeled.filter(~F.col('malware_family').isin(['Benign', 'Unknown']))
-
-    ips_per_family_df = malicious_df.groupBy('malware_family').agg(
-        F.countDistinct('id_orig_h').alias('count')).collect()
-    ips_per_family = {row['malware_family']: int(row['count']) for row in ips_per_family_df}
-    min_ips_per_family = min(ips_per_family.values()) if ips_per_family else 0
-
-    # Final recommendation based on heterogeneous graph
     stats = {
-        'approach_comparison': {
-            'ip_to_ip_graph': {**ip_graph_stats, 'assessment': 'NOT RECOMMENDED - Too sparse for GNN'},
-            'heterogeneous_graph': {**hetero_graph_stats, 'assessment': 'RECOMMENDED'}
-        },
-        'recommended_approach': 'heterogeneous_graph',
-        'graph_type': 'Heterogeneous (Device-Service-Subnet)',
-        'ips_per_family': ips_per_family,
-        'min_ips_per_family': min_ips_per_family,
+        'node_counts': {},
+        'edge_counts': {},
+        'connectivity': {},
         'feasibility': 'GO',
-        'reason': 'Heterogeneous graph structure is dense and meaningful, making it suitable for GNN.'
+        'reason': 'Sufficient graph structure for GNN models'
     }
 
-    # Feasibility checks for the recommended heterogeneous graph
-    if hetero_graph_stats['density'] < 0.001:  # 0.1%
-        stats['feasibility'] = 'WARNING'
-        stats[
-            'reason'] = f"Heterogeneous graph density is very low ({hetero_graph_stats['density']:.4f}). GNN may still struggle."
-    elif min_ips_per_family > 0 and min_ips_per_family < 20:
-        stats['feasibility'] = 'WARNING'
-        stats[
-            'reason'] = f'Some malware families have very few unique devices ({min_ips_per_family}). Node classification may be difficult.'
+    # ========================================
+    # 1. DERIVE GRAPH KEYS
+    # ========================================
 
-    # Summary
-    print("\n" + "─" * 70)
-    print("OVERALL GRAPH FEASIBILITY SUMMARY")
-    print("─" * 70)
-    print(f"✓ Recommended Graph Type: {stats['graph_type']}")
-    print("✓ Node Counts:")
-    for name, count in hetero_graph_stats['nodes'].items():
-        if name != 'total':
-            print(f"    - {name.capitalize()}: {count:,}")
-    print("✓ Edge Counts:")
-    print(f"    - Total Edges: {hetero_graph_stats['edges']['total']:,}")
-    print(f"✓ Feasibility: {stats['feasibility']}")
+    print("\n[1/5] Deriving graph keys (device, service, subnet)...")
+
+    # Device: Use id.orig_h as device identifier
+    df = df.withColumn(
+        "device_addr",
+        F.when(
+            F.col("`id.orig_h`").isNotNull() & (F.col("`id.orig_h`") != ""),
+            F.col("`id.orig_h`")
+        ).otherwise(F.lit(None))
+    )
+
+    # Service: port:proto
+    df = df.withColumn(
+        "service_key",
+        F.concat_ws(
+            ":",
+            F.col("`id.resp_p`").cast("string"),
+            F.col("proto").cast("string")
+        )
+    )
+
+    # Subnet: First 3 octets of id.resp_h (like /24)
+    df = df.withColumn(
+        "subnet_block",
+        F.regexp_extract(F.col("`id.resp_h`"), r"^(\d+\.\d+\.\d+)\.\d+$", 1)
+    )
+
+    print(f"   ✅ Graph keys derived")
+
+    # ========================================
+    # 2. COUNT NODES
+    # ========================================
+
+    print("\n[2/5] Counting nodes...")
+
+    # Device nodes
+    num_devices = df.select("device_addr").where(
+        F.col("device_addr").isNotNull() & (F.col("device_addr") != "")
+    ).distinct().count()
+
+    # Service nodes
+    num_services = df.select("service_key").where(
+        F.col("service_key").isNotNull() & (F.col("service_key") != "")
+    ).distinct().count()
+
+    # Subnet nodes
+    num_subnets = df.select("subnet_block").where(
+        F.col("subnet_block").isNotNull() & (F.col("subnet_block") != "")
+    ).distinct().count()
+
+    total_nodes = num_devices + num_services + num_subnets
+
+    stats['node_counts'] = {
+        'devices': num_devices,
+        'services': num_services,
+        'subnets': num_subnets,
+        'total': total_nodes
+    }
+
+    print(f"   Device nodes:  {num_devices:,}")
+    print(f"   Service nodes: {num_services:,}")
+    print(f"   Subnet nodes:  {num_subnets:,}")
+    print(f"   Total nodes:   {total_nodes:,}")
+
+    # ========================================
+    # 3. COUNT EDGES
+    # ========================================
+
+    print("\n[3/5] Counting edges...")
+
+    # Device-Service edges
+    num_dev_service_edges = df.select("device_addr", "service_key").where(
+        F.col("device_addr").isNotNull() &
+        (F.col("device_addr") != "") &
+        F.col("service_key").isNotNull() &
+        (F.col("service_key") != "")
+    ).distinct().count()
+
+    # Device-Subnet edges
+    num_dev_subnet_edges = df.select("device_addr", "subnet_block").where(
+        F.col("device_addr").isNotNull() &
+        (F.col("device_addr") != "") &
+        F.col("subnet_block").isNotNull() &
+        (F.col("subnet_block") != "")
+    ).distinct().count()
+
+    total_edges = num_dev_service_edges + num_dev_subnet_edges
+
+    stats['edge_counts'] = {
+        'device_service': num_dev_service_edges,
+        'device_subnet': num_dev_subnet_edges,
+        'total': total_edges
+    }
+
+    print(f"   Device-Service edges: {num_dev_service_edges:,}")
+    print(f"   Device-Subnet edges:  {num_dev_subnet_edges:,}")
+    print(f"   Total edges:          {total_edges:,}")
+
+    # ========================================
+    # 4. CONNECTIVITY ANALYSIS
+    # ========================================
+
+    print("\n[4/5] Analyzing connectivity...")
+
+    # Average degree per device
+    if num_devices > 0:
+        avg_services_per_device = num_dev_service_edges / num_devices
+        stats['connectivity']['avg_services_per_device'] = round(avg_services_per_device, 2)
+        print(f"   Avg services per device: {avg_services_per_device:.2f}")
+
+    # Graph density (edges / possible_edges)
+    # For bipartite graph: max edges = num_devices * num_services
+    if num_devices > 0 and num_services > 0:
+        max_possible_edges = num_devices * num_services
+        density = (num_dev_service_edges / max_possible_edges) * 100
+        stats['connectivity']['graph_density'] = round(density, 4)
+        print(f"   Graph density: {density:.4f}%")
+
+    # Check for isolated devices (devices with no service connections)
+    device_with_edges = df.select("device_addr").where(
+        F.col("device_addr").isNotNull() &
+        (F.col("device_addr") != "") &
+        F.col("service_key").isNotNull() &
+        (F.col("service_key") != "")
+    ).distinct().count()
+
+    isolated_devices = num_devices - device_with_edges
+    stats['connectivity']['isolated_devices'] = isolated_devices
+    stats['connectivity']['isolated_device_percentage'] = round(
+        (isolated_devices / num_devices * 100) if num_devices > 0 else 0, 2
+    )
+
+    print(f"   Isolated devices: {isolated_devices:,} ({stats['connectivity']['isolated_device_percentage']}%)")
+
+    # ========================================
+    # 5. FEASIBILITY ASSESSMENT
+    # ========================================
+
+    print("\n[5/5] Assessing GNN feasibility...")
+
+    # Check minimum requirements for GNN
+    if total_nodes < 100:
+        stats['feasibility'] = 'NO-GO'
+        stats['reason'] = f'Too few nodes: {total_nodes} (need 100+ for GNN)'
+    elif num_devices < 50:
+        stats['feasibility'] = 'NO-GO'
+        stats['reason'] = f'Too few device nodes: {num_devices} (need 50+)'
+    elif total_edges < 200:
+        stats['feasibility'] = 'WARNING'
+        stats['reason'] = f'Few edges: {total_edges} (prefer 1000+ for robust GNN training)'
+    elif stats['connectivity']['isolated_device_percentage'] > 50:
+        stats['feasibility'] = 'WARNING'
+        stats['reason'] = (
+            f"{stats['connectivity']['isolated_device_percentage']:.1f}% devices are isolated. "
+            f"GNN works best with connected graphs."
+        )
+    elif avg_services_per_device < 2:
+        stats['feasibility'] = 'WARNING'
+        stats['reason'] = (
+            f'Low connectivity: avg {avg_services_per_device:.1f} services per device. '
+            f'Prefer 5+ connections per device.'
+        )
+
+    # Recommendations
+    stats['recommendations'] = []
+
+    if stats['feasibility'] == 'GO':
+        stats['recommendations'].append(
+            'Graph structure is suitable for GNN models (GAT, GraphSAGE, HeteroGNN)'
+        )
+        stats['recommendations'].append(
+            'Consider heterogeneous GNN to leverage device-service-subnet relationships'
+        )
+    elif stats['feasibility'] == 'WARNING':
+        stats['recommendations'].append(
+            'GNN possible but may not outperform traditional ML significantly'
+        )
+        stats['recommendations'].append(
+            'Consider traditional ML (XGBoost, LightGBM) as baseline'
+        )
+    else:  # NO-GO
+        stats['recommendations'].append(
+            'GNN not recommended. Use traditional ML models instead.'
+        )
+
+    # GNN-specific recommendations
+    if num_devices >= 1000 and total_edges >= 5000:
+        stats['recommendations'].append(
+            'Strong candidate for Graph Attention Networks (GAT) - can learn edge importance'
+        )
+
+    if num_services > 100:
+        stats['recommendations'].append(
+            'High service diversity - good for learning service-based attack patterns'
+        )
+
+    # ========================================
+    # SUMMARY
+    # ========================================
+
+    print("\n" + "=" * 70)
+    print("GRAPH STRUCTURE SUMMARY")
+    print("=" * 70)
+    print(
+        f"Total nodes:  {total_nodes:,} (Device: {num_devices:,}, Service: {num_services:,}, Subnet: {num_subnets:,})")
+    print(f"Total edges:  {total_edges:,}")
+    print(f"Connectivity: {avg_services_per_device:.2f} services/device")
+    print(f"Isolated:     {isolated_devices:,} devices ({stats['connectivity']['isolated_device_percentage']}%)")
+    print(f"\n✅ Feasibility: {stats['feasibility']}")
     if stats['feasibility'] != 'GO':
-        print(f"  Reason: {stats['reason']}")
+        print(f"   Reason: {stats['reason']}")
+
+    print(f"\n💡 Recommendations:")
+    for rec in stats['recommendations']:
+        print(f"   - {rec}")
+
+    print("=" * 70)
 
     return stats
 
+
+if __name__ == "__main__":
+    """Standalone testing"""
+    import os
+    from config import Config
+    from analysis.stage1.utils import load_raw_data, save_json_report
+
+    Config.ensure_output_dirs()
+    spark = Config.get_spark_session("Stage1-GraphAnalysis-Test")
+
+    try:
+        df = load_raw_data(spark)
+
+        # Graph structure analysis
+        graph_stats = analyze_graph_structure(df)
+        output_path = os.path.join(Config.STAGE1_FEASIBILITY_DIR, 'graph_feasibility.json')
+        save_json_report(graph_stats, output_path)
+
+    finally:
+        if not Config.is_databricks():
+            spark.stop()

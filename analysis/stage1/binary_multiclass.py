@@ -1,22 +1,28 @@
 """
-Binary and Multi-Class Classification Feasibility Analysis (PySpark).
+Stage 1: Binary and Multiclass Classification Feasibility - PySpark Version
+Works on both local and Databricks.
+
+Analyzes:
+- Binary classification: Benign vs Malicious
+- Multiclass classification: Attack type detection
+
+Returns feasibility assessments (GO/WARNING/NO-GO).
 """
 
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, functions as F
+from analysis.stage1.utils import (
+    get_combined_label_column, parse_binary_label,
+    parse_attack_type, get_numeric_columns
+)
 
-# Get numeric features
-from .unsupervised_models import get_numeric_columns
-from .utils import get_combined_label_column
-from .utils import parse_binary_label, parse_attack_type
 
-
-def analyze_binary_classification(df):
+def analyze_binary_classification(df: DataFrame) -> dict:
     """
     Analyze feasibility for binary classification (Benign vs Malicious).
-    
+
     Args:
-        df: Spark DataFrame (raw data)
-        
+        df: Spark DataFrame with raw IoT-23 data
+
     Returns:
         dict: Binary classification feasibility stats
     """
@@ -24,8 +30,8 @@ def analyze_binary_classification(df):
     print("BINARY CLASSIFICATION FEASIBILITY")
     print("=" * 70)
 
-    # Parse labels from detailed-label column (NOT filename)
-    print("  Parsing labels from 'detailed-label' column...")
+    # Parse labels from detailed-label column
+    print("  Parsing binary labels from 'detailed-label' column...")
     combined_col = get_combined_label_column('label', 'detailed-label')
     df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
 
@@ -36,6 +42,8 @@ def analyze_binary_classification(df):
     benign_count = class_dict.get('Benign', 0)
     malicious_count = class_dict.get('Malicious', 0)
     total = benign_count + malicious_count
+
+    # Get numeric features
     feature_cols = get_numeric_columns(df_labeled)
 
     stats = {
@@ -44,11 +52,12 @@ def analyze_binary_classification(df):
         'total_samples': total,
         'benign_percentage': round((benign_count / total) * 100, 2) if total > 0 else 0,
         'malicious_percentage': round((malicious_count / total) * 100, 2) if total > 0 else 0,
-        'imbalance_ratio': round(max(benign_count, malicious_count) / min(benign_count, malicious_count), 2) if min(
-            benign_count, malicious_count) > 0 else float('inf'),
+        'imbalance_ratio': round(
+            max(benign_count, malicious_count) / min(benign_count, malicious_count), 2
+        ) if min(benign_count, malicious_count) > 0 else float('inf'),
         'missing_per_class': {},
-        'numeric_feature_count': len(feature_cols),  # ✅ ADD THIS
-        'numeric_features': feature_cols[:20],  # ✅ ADD THIS (first 20)
+        'numeric_feature_count': len(feature_cols),
+        'numeric_features': feature_cols[:20],  # First 20 features
         'feasibility': 'GO',
         'reason': 'Sufficient samples and acceptable balance'
     }
@@ -60,8 +69,14 @@ def analyze_binary_classification(df):
         label_count = label_df.count()
 
         if label_count > 0:
-            # Count nulls across all columns
-            null_count = sum([label_df.filter(F.col(col).isNull()).count() for col in df.columns])
+            # Count nulls across all columns (handle dotted/hyphenated column names)
+            null_count = sum([
+                label_df.filter(
+                    (F.col(f"`{col}`") if ('.' in col or '-' in col) else F.col(col)).isNull()
+                ).count()
+                for col in df.columns
+            ])
+
             total_cells = label_count * len(df.columns)
             missing_pct = round((null_count / total_cells) * 100, 2) if total_cells > 0 else 0
             stats['missing_per_class'][label] = missing_pct
@@ -69,8 +84,10 @@ def analyze_binary_classification(df):
     # Feasibility checks
     if benign_count < 1000 or malicious_count < 1000:
         stats['feasibility'] = 'NO-GO'
-        stats[
-            'reason'] = f'Insufficient samples per class (need >1000 each). Benign: {benign_count}, Malicious: {malicious_count}'
+        stats['reason'] = (
+            f'Insufficient samples per class (need >1000 each). '
+            f'Benign: {benign_count}, Malicious: {malicious_count}'
+        )
     elif stats['imbalance_ratio'] > 99:
         stats['feasibility'] = 'WARNING'
         stats['reason'] = f'Severe class imbalance ({stats["imbalance_ratio"]}:1 ratio)'
@@ -79,28 +96,29 @@ def analyze_binary_classification(df):
         stats['reason'] = 'High missing percentage (>50%) in one or more classes'
 
     # Summary
-    print(f"\n✓ Benign: {benign_count:,} ({stats['benign_percentage']}%)")
-    print(f"✓ Malicious: {malicious_count:,} ({stats['malicious_percentage']}%)")
-    print(f"✓ Imbalance ratio: {stats['imbalance_ratio']}:1")
-    print(f"✓ Feasibility: {stats['feasibility']}")
+    print(f"\n✅ Benign: {benign_count:,} ({stats['benign_percentage']}%)")
+    print(f"✅ Malicious: {malicious_count:,} ({stats['malicious_percentage']}%)")
+    print(f"✅ Imbalance ratio: {stats['imbalance_ratio']}:1")
+    print(f"✅ Numeric features: {len(feature_cols)}")
+    print(f"✅ Feasibility: {stats['feasibility']}")
     if stats['feasibility'] != 'GO':
-        print(f"  Reason: {stats['reason']}")
+        print(f"   Reason: {stats['reason']}")
 
     return stats
 
 
-def analyze_multiclass_classification(df):
+def analyze_multiclass_classification(df: DataFrame) -> dict:
     """
-    Analyze feasibility for multi-class attack type classification.
-    
+    Analyze feasibility for multiclass attack type classification.
+
     Args:
-        df: Spark DataFrame (raw data)
-        
+        df: Spark DataFrame with raw IoT-23 data
+
     Returns:
-        dict: Multi-class classification feasibility stats
+        dict: Multiclass classification feasibility stats
     """
     print("\n" + "=" * 70)
-    print("MULTI-CLASS ATTACK TYPE FEASIBILITY")
+    print("MULTICLASS ATTACK TYPE FEASIBILITY")
     print("=" * 70)
 
     # Parse labels
@@ -109,7 +127,7 @@ def analyze_multiclass_classification(df):
     df_labeled = df.withColumn('parsed_label', parse_binary_label(combined_col))
     df_labeled = df_labeled.withColumn('attack_type', parse_attack_type(combined_col))
 
-    # Filter only malicious (multi-class only on malicious traffic)
+    # Filter only malicious (multiclass only on malicious traffic)
     malicious_df = df_labeled.filter(F.col('parsed_label') == 'Malicious')
     malicious_count = malicious_df.count()
 
@@ -129,6 +147,8 @@ def analyze_multiclass_classification(df):
     # Identify rare classes
     rare_threshold = 100
     rare_classes = {k: v for k, v in attack_dict.items() if v < rare_threshold}
+
+    # Calculate missing values per attack type
     # Calculate missing values per attack type
     print("  Calculating missing values per attack type...")
     missing_per_class = {}
@@ -137,54 +157,94 @@ def analyze_multiclass_classification(df):
         attack_count = attack_df.count()
 
         if attack_count > 0:
-            null_count = sum([attack_df.filter(F.col(col).isNull()).count() for col in df.columns])
+            null_count = sum([
+                attack_df.filter(
+                    (F.col(f"`{col}`") if ('.' in col or '-' in col) else F.col(col)).isNull()
+                ).count()
+                for col in df.columns
+            ])
+
             total_cells = attack_count * len(df.columns)
             missing_pct = round((null_count / total_cells) * 100, 2) if total_cells > 0 else 0
             missing_per_class[attack_type] = missing_pct
 
+    # Get numeric features
     feature_cols = get_numeric_columns(malicious_df)
+
     stats = {
         'total_malicious_samples': malicious_count,
-        'unique_attack_types': len(attack_dict),
+        'num_attack_types': len(attack_dict),
         'attack_type_distribution': attack_dict,
         'rare_classes': rare_classes,
-        'rare_class_count': len(rare_classes),
-        'min_samples_per_class': min(attack_dict.values()) if attack_dict else 0,
-        'max_samples_per_class': max(attack_dict.values()) if attack_dict else 0,
-        'avg_samples_per_class': round(sum(attack_dict.values()) / len(attack_dict), 2) if attack_dict else 0,
-        'missing_per_class': missing_per_class,  # ✅ ADD THIS
-        'numeric_feature_count': len(feature_cols),  # ✅ ADD THIS
-        'numeric_features': feature_cols[:20],  # ✅ ADD THIS
+        'num_rare_classes': len(rare_classes),
+        'missing_per_class': missing_per_class,
+        'numeric_feature_count': len(feature_cols),
+        'numeric_features': feature_cols[:20],
         'feasibility': 'GO',
-        'reason': 'Sufficient attack types and samples'
+        'reason': 'Sufficient samples across attack types'
     }
 
     # Feasibility checks
-    if stats['unique_attack_types'] < 3:
-        stats['feasibility'] = 'NO-GO'
-        stats['reason'] = f'Too few attack types ({stats["unique_attack_types"]}). Need at least 3.'
-    elif stats['min_samples_per_class'] < 50:
+    if malicious_count < 5000:
         stats['feasibility'] = 'WARNING'
-        stats[
-            'reason'] = f'Some classes have very few samples (min: {stats["min_samples_per_class"]}). Consider GAN augmentation.'
+        stats['reason'] = f'Low malicious sample count: {malicious_count:,} (prefer 5000+)'
+    elif len(attack_dict) < 3:
+        stats['feasibility'] = 'WARNING'
+        stats['reason'] = f'Very few attack types: {len(attack_dict)} (prefer 5+)'
     elif len(rare_classes) > len(attack_dict) * 0.5:
         stats['feasibility'] = 'WARNING'
-        stats['reason'] = f'Over 50% of classes are rare (<{rare_threshold} samples). GAN augmentation recommended.'
+        stats['reason'] = (
+            f'{len(rare_classes)} out of {len(attack_dict)} attack types have <{rare_threshold} samples'
+        )
 
     # Summary
-    print(f"\n✓ Total malicious: {stats['total_malicious_samples']:,}")
-    print(f"✓ Unique attack types: {stats['unique_attack_types']}")
-    print(f"✓ Min samples per class: {stats['min_samples_per_class']}")
-    print(f"✓ Rare classes (<{rare_threshold}): {stats['rare_class_count']}")
-    print(f"✓ Feasibility: {stats['feasibility']}")
-    if stats['feasibility'] != 'GO':
-        print(f"  Reason: {stats['reason']}")
+    print(f"\n✅ Total malicious samples: {malicious_count:,}")
+    print(f"✅ Number of attack types: {len(attack_dict)}")
+    print(f"✅ Numeric features: {len(feature_cols)}")
 
-    # Show top 10 attack types
-    if attack_dict:
-        print("\n  Top attack types:")
-        sorted_attacks = sorted(attack_dict.items(), key=lambda x: x[1], reverse=True)[:10]
-        for attack, count in sorted_attacks:
-            print(f"    {attack}: {count:,}")
+    print(f"\n📊 Attack type distribution:")
+    sorted_attacks = sorted(attack_dict.items(), key=lambda x: x[1], reverse=True)
+    for attack_type, count in sorted_attacks[:10]:  # Top 10
+        pct = (count / malicious_count) * 100
+        print(f"   {attack_type}: {count:,} ({pct:.1f}%)")
+
+    if len(sorted_attacks) > 10:
+        print(f"   ... and {len(sorted_attacks) - 10} more")
+
+    if rare_classes:
+        print(f"\n⚠️  Rare classes (<{rare_threshold} samples): {len(rare_classes)}")
+        for attack_type, count in sorted(rare_classes.items(), key=lambda x: x[1]):
+            print(f"   {attack_type}: {count}")
+
+    print(f"\n✅ Feasibility: {stats['feasibility']}")
+    if stats['feasibility'] != 'GO':
+        print(f"   Reason: {stats['reason']}")
 
     return stats
+
+
+if __name__ == "__main__":
+    """Standalone testing"""
+    import os
+    from config import Config
+    from analysis.stage1.utils import load_raw_data, save_json_report
+
+    Config.ensure_output_dirs()
+    spark = Config.get_spark_session("Stage1-BinaryMulticlass-Test")
+
+    try:
+        df = load_raw_data(spark)
+
+        # Binary classification analysis
+        binary_stats = analyze_binary_classification(df)
+        binary_path = os.path.join(Config.STAGE1_FEASIBILITY_DIR, 'binary_feasibility.json')
+        save_json_report(binary_stats, binary_path)
+
+        # Multiclass classification analysis
+        multiclass_stats = analyze_multiclass_classification(df)
+        multiclass_path = os.path.join(Config.STAGE1_FEASIBILITY_DIR, 'multiclass_feasibility.json')
+        save_json_report(multiclass_stats, multiclass_path)
+
+    finally:
+        if not Config.is_databricks():
+            spark.stop()
