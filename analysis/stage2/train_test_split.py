@@ -34,7 +34,7 @@ from analysis.stage2.utils import (
 
 def create_stratified_splits(df, label_col="label", train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, seed=None):
     """
-    Create stratified train/val/test splits using Spark's sampleBy.
+    Create stratified train/val/test splits using random assignment.
 
     Args:
         df: Spark DataFrame with features
@@ -63,33 +63,24 @@ def create_stratified_splits(df, label_col="label", train_ratio=0.7, val_ratio=0
     for label, count in class_dict.items():
         print(f"      {label}: {count:,} samples")
 
-    # Create fractions dictionary for sampleBy
-    # sampleBy expects: {class_value: fraction_to_sample}
-    train_fractions = {label: train_ratio for label in class_dict.keys()}
+    # Add a random column for splitting (ensures no overlap)
+    df_with_rand = df.withColumn("_rand_split", F.rand(seed))
 
-    # Sample training set
-    print(f"\n   Sampling training set ({train_ratio:.0%})...")
-    train_df = df.sampleBy(label_col, train_fractions, seed=seed)
+    # Calculate thresholds
+    train_threshold = train_ratio
+    val_threshold = train_ratio + val_ratio
 
-    # Remaining data (for val + test)
-    print(f"   Computing remaining data...")
-    remaining_df = df.subtract(train_df)
-
-    # Split remaining into val/test
-    # Adjust ratios for remaining data (val + test = 1 - train_ratio)
-    remaining_total = val_ratio + test_ratio
-    val_fraction_of_remaining = val_ratio / remaining_total
-
-    val_fractions = {label: val_fraction_of_remaining for label in class_dict.keys()}
-
-    print(f"   Sampling validation set ({val_ratio:.0%} of original)...")
-    val_df = remaining_df.sampleBy(label_col, val_fractions, seed=seed + 1)
-
-    print(f"   Computing test set...")
-    test_df = remaining_df.subtract(val_df)
+    # Split based on random value (guarantees no overlap)
+    print(f"\n   Assigning splits based on random values...")
+    
+    train_df = df_with_rand.filter(F.col("_rand_split") < train_threshold).drop("_rand_split")
+    val_df = df_with_rand.filter(
+        (F.col("_rand_split") >= train_threshold) & 
+        (F.col("_rand_split") < val_threshold)
+    ).drop("_rand_split")
+    test_df = df_with_rand.filter(F.col("_rand_split") >= val_threshold).drop("_rand_split")
 
     return train_df, val_df, test_df
-
 
 # ============================================================================
 # SPLIT VALIDATION

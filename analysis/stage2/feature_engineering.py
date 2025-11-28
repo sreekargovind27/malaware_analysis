@@ -51,7 +51,11 @@ def load_raw_flows(spark):
     Returns:
         Spark DataFrame with normalized raw data
     """
-    input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+    if Config.is_databricks():
+        input_glob = f"{Config.RAW_DIR_ORIGINAL}/*.csv"
+    else:
+        input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+
     print(f"📂 Reading raw CSVs from {input_glob}")
 
     df = (
@@ -66,7 +70,7 @@ def load_raw_flows(spark):
     # Track which capture each row came from
     df = df.withColumn(
         "Source_Folder",
-        F.regexp_extract(F.input_file_name(), r"([^/]+)\.csv$", 1)
+        F.regexp_extract(F.col("_metadata.file_path"), r"([^/]+)\.csv$", 1)
     )
 
     # All columns we expect downstream
@@ -106,9 +110,15 @@ def load_raw_flows(spark):
         """
         return df_in.withColumn(col_name, F.col(f"`{col_name}`").cast(target_type))
 
-    # Cast port columns
+    # Cast port columns (safe casting - some rows have IP addresses in port columns due to data issues)
     for port_col in ["id.orig_p", "id.resp_p"]:
-        df = safe_cast_numeric(df, port_col, T.IntegerType())
+        df = df.withColumn(
+            port_col,
+            F.when(F.col(f"`{port_col}`").rlike("^[0-9]+$"),
+                F.col(f"`{port_col}`").cast(T.IntegerType()))
+            .otherwise(None)
+        )
+
 
     # Cast numeric columns
     numeric_cols = [
@@ -116,7 +126,12 @@ def load_raw_flows(spark):
         "orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes"
     ]
     for nc in numeric_cols:
-        df = safe_cast_numeric(df, nc, T.DoubleType())
+        df = df.withColumn(
+            nc,
+            F.when(F.col(f"`{nc}`").rlike("^-?[0-9]+\\.?[0-9]*$"),
+                F.col(f"`{nc}`").cast(T.DoubleType()))
+            .otherwise(None)
+        )
 
     initial_count = df.count()
     print(f"✅ Loaded {initial_count:,} raw flows with {len(df.columns)} columns")
@@ -304,18 +319,20 @@ def extract_ip_features(df):
     """
     print("\n🌐 Extracting IP features...")
 
-    # Extract octets from id.orig_h
+    # Extract octets from id.orig_h (safe casting for empty strings)
     for i in range(1, 5):
+        octet = F.regexp_extract(F.col("`id.orig_h`"), r"^(\d+)\.(\d+)\.(\d+)\.(\d+)$", i)
         df = df.withColumn(
             f"orig_h_octet{i}",
-            F.regexp_extract(F.col("`id.orig_h`"), rf"^(\d+)\.(\d+)\.(\d+)\.(\d+)$", i).cast("int")
+            F.when(octet != "", octet.cast("int")).otherwise(None)
         )
 
-    # Extract octets from id.resp_h
+    # Extract octets from id.resp_h (safe casting for empty strings)
     for i in range(1, 5):
+        octet = F.regexp_extract(F.col("`id.resp_h`"), r"^(\d+)\.(\d+)\.(\d+)\.(\d+)$", i)
         df = df.withColumn(
             f"resp_h_octet{i}",
-            F.regexp_extract(F.col("`id.resp_h`"), rf"^(\d+)\.(\d+)\.(\d+)\.(\d+)$", i).cast("int")
+            F.when(octet != "", octet.cast("int")).otherwise(None)
         )
 
     # Port features (already cast as int)
@@ -406,15 +423,8 @@ def engineer_custom_features(df):
 
 def engineer_categorical_features(df):
     """
-    Encode categorical features:
-    - service, history -> StringIndexer (label encoding)
-    - proto, conn_state -> StringIndexer + OneHotEncoder
-
-    Args:
-        df: DataFrame with behavioral features
-
-    Returns:
-        DataFrame with encoded categorical features
+    Encode categorical features using SQL-based approach (Serverless compatible).
+    Avoids Spark ML Pipeline which has model size limits on Serverless.
     """
     print("\n🏷️  Encoding categorical features...")
 
@@ -435,46 +445,25 @@ def engineer_categorical_features(df):
         else:
             df = df.withColumn(c, F.lit("unknown"))
 
-    stages = []
-
-    # service/history -> index only (high cardinality)
+    # For high-cardinality columns (service, history): use hash-based encoding
+    # This avoids the huge StringIndexer model
     for c in ["service", "history"]:
-        idx_col = f"{c}_idx"
-        stages.append(
-            StringIndexer(
-                inputCol=c,
-                outputCol=idx_col,
-                handleInvalid="keep"
-            )
-        )
+        df = df.withColumn(f"{c}_idx", F.abs(F.hash(F.col(c))) % 1000)
 
-    # proto/conn_state -> OneHotEncode (low cardinality)
-    for c in ["proto", "conn_state"]:
-        idx_col = f"{c}_idx"
-        vec_col = f"{c}_vec"
-        stages.append(
-            StringIndexer(
-                inputCol=c,
-                outputCol=idx_col,
-                handleInvalid="keep"
-            )
-        )
-        stages.append(
-            OneHotEncoder(
-                inputCol=idx_col,
-                outputCol=vec_col
-            )
-        )
+    # For low-cardinality columns (proto, conn_state): manual one-hot encoding
+    # proto: typically tcp, udp, icmp
+    df = df.withColumn("proto_tcp", (F.col("proto") == "tcp").cast("int"))
+    df = df.withColumn("proto_udp", (F.col("proto") == "udp").cast("int"))
+    df = df.withColumn("proto_icmp", (F.col("proto") == "icmp").cast("int"))
 
-    # Fit pipeline
-    pipe = Pipeline(stages=stages)
-    model = pipe.fit(df)
-    df = model.transform(df)
+    # conn_state: common states
+    common_states = ["S0", "S1", "SF", "REJ", "RSTO", "RSTR", "OTH"]
+    for state in common_states:
+        df = df.withColumn(f"conn_state_{state}", (F.col("conn_state") == state).cast("int"))
 
-    print(f"   ✅ Encoded categorical features: service_idx, history_idx, proto_vec, conn_state_vec")
+    print(f"   ✅ Encoded categorical features: service_idx, history_idx, proto_*, conn_state_*")
 
     return df
-
 
 # ============================================================================
 # FEATURE LIST BUILDING

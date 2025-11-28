@@ -33,7 +33,13 @@ def load_raw_data(spark: SparkSession) -> DataFrame:
     Returns:
         Spark DataFrame with normalized raw data
     """
-    input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+    # For Unity Catalog Volumes, don't use os.path.join
+    if Config.is_databricks():
+        input_glob = f"{Config.RAW_DIR_ORIGINAL}/*.csv"
+    else:
+        input_glob = os.path.join(Config.RAW_DIR_ORIGINAL, "*.csv")
+
+
     print(f"\n📂 Loading raw CSVs from: {input_glob}")
 
     # Read all CSVs
@@ -46,11 +52,12 @@ def load_raw_data(spark: SparkSession) -> DataFrame:
         .csv(input_glob)
     )
 
-    # Add source folder tracking
+    # Add source folder tracking (Unity Catalog compatible)
     df = df.withColumn(
         "Source_Folder",
-        F.regexp_extract(F.input_file_name(), r"([^/]+)\.csv$", 1)
+        F.regexp_extract(F.col("_metadata.file_path"), r"([^/]+)\.csv$", 1)
     )
+
 
     # Normalize column names (handle dotted vs underscored)
     expected_cols = [
@@ -86,12 +93,25 @@ def load_raw_data(spark: SparkSession) -> DataFrame:
         "orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes"
     ]
 
+    # Cast numeric columns (safe casting to handle '-' and other invalid values)
     for nc in numeric_cols:
-        df = df.withColumn(nc, F.col(nc).cast(T.DoubleType()))
+        df = df.withColumn(
+            nc,
+            F.when(F.col(nc).rlike("^-?[0-9]+\.?[0-9]*$"), 
+                F.col(nc).cast(T.DoubleType()))
+            .otherwise(None)
+        )
 
-    # Cast port columns
+
+    # Cast port columns (safe casting to handle malformed data)
     for port_col in ["id.orig_p", "id.resp_p"]:
-        df = df.withColumn(port_col, F.col(f"`{port_col}`").cast(T.IntegerType()))
+        df = df.withColumn(
+            port_col,
+            F.when(F.col(f"`{port_col}`").rlike("^[0-9]+$"), 
+                F.col(f"`{port_col}`").cast(T.IntegerType()))
+            .otherwise(None)
+        )
+
 
     row_count = df.count()
     print(f"✅ Loaded {row_count:,} raw flows from {df.select('Source_Folder').distinct().count()} captures")
@@ -254,19 +274,12 @@ def get_numeric_columns(df: DataFrame) -> list:
 # ============================================================================
 
 def save_json_report(data: dict, filepath: str):
-    """
-    Save dictionary as formatted JSON file.
-
-    Args:
-        data: Dictionary to save
-        filepath: Output file path
-    """
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-    # Convert any non-serializable types
+    """Save dictionary as formatted JSON file (Volumes-compatible)."""
+    import json
+    from config import Config
+    
+    # Convert non-serializable types
     def convert_types(obj):
-        """Convert non-JSON-serializable types"""
         if isinstance(obj, (int, float, str, bool, type(None))):
             return obj
         elif isinstance(obj, dict):
@@ -275,16 +288,25 @@ def save_json_report(data: dict, filepath: str):
             return [convert_types(item) for item in obj]
         else:
             return str(obj)
-
+    
     clean_data = convert_types(data)
-
-    # Write JSON
-    with open(filepath, 'w') as f:
-        json.dump(clean_data, f, indent=2)
-
-    print(f"💾 Report saved to: {filepath}")
-
-
+    json_str = json.dumps(clean_data, indent=2)
+    
+    if Config.is_databricks():
+        # Import dbutils properly for Serverless
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        dbutils = DBUtils(spark)
+        # Write to Volumes using dbutils
+        dbutils.fs.put(filepath, json_str, overwrite=True)
+    else:
+        # Local: use regular file writing
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, 'w') as f:
+            f.write(json_str)
+            
 def load_json_report(filepath: str) -> dict:
     """
     Load JSON report from file.

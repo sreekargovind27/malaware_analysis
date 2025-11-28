@@ -119,46 +119,70 @@ def load_split_spark(spark: SparkSession, split_name: str) -> DataFrame:
 
 def save_feature_list(feature_list: list, filepath: str = None):
     """
-    Save the feature list to a joblib file.
+    Save the feature list to a JSON file (Serverless compatible).
 
     Args:
         feature_list: List of feature column names
         filepath: Optional custom path (defaults to Config.FEATURE_LIST_PATH)
     """
+    import json
+    
     if filepath is None:
         filepath = Config.FEATURE_LIST_PATH
+    
+    # Change extension to .json for Serverless compatibility
+    if filepath.endswith('.joblib'):
+        filepath = filepath.replace('.joblib', '.json')
 
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    joblib.dump(feature_list, filepath)
+    if Config.is_databricks():
+        # Use dbutils.fs.put to write directly to Volumes (no local file needed)
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        dbutils = DBUtils(spark)
+        
+        json_str = json.dumps(feature_list, indent=2)
+        dbutils.fs.put(filepath, json_str, overwrite=True)
+    else:
+        # Local: use joblib
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        joblib.dump(feature_list, filepath)
+    
     print(f"💾 Feature list saved ({len(feature_list)} features): {filepath}")
 
 
 def load_feature_list(filepath: str = None) -> list:
     """
-    Load the feature list from a joblib file.
+    Load the feature list from file.
 
     Args:
         filepath: Optional custom path (defaults to Config.FEATURE_LIST_PATH)
 
     Returns:
         List of feature column names
-
-    Raises:
-        FileNotFoundError: If feature list doesn't exist
     """
+    import json
+    
     if filepath is None:
         filepath = Config.FEATURE_LIST_PATH
 
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(
-            f"Feature list not found at: {filepath}\n"
-            f"Please run feature_engineering.py first."
-        )
-
-    features = joblib.load(filepath)
+    # Check for JSON version first on Databricks
+    if Config.is_databricks():
+        json_path = filepath.replace('.joblib', '.json') if filepath.endswith('.joblib') else filepath
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        dbutils = DBUtils(spark)
+        
+        content = dbutils.fs.head(json_path, 1000000)  # Read up to 1MB
+        features = json.loads(content)
+    else:
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Feature list not found at: {filepath}")
+        features = joblib.load(filepath)
+    
     print(f"📂 Feature list loaded ({len(features)} features)")
     return features
-
 
 # ==================================================================
 # REPARTITIONING UTILITIES (Databricks Optimization)
@@ -205,27 +229,36 @@ def smart_coalesce(df: DataFrame, num_partitions: int = None) -> DataFrame:
                           if Config.is_databricks()
                           else 4)
 
-    current_partitions = df.rdd.getNumPartitions()
-
-    if current_partitions > num_partitions:
-        print(f"📊 Coalescing from {current_partitions} to {num_partitions} partitions")
+    if Config.is_databricks():
+        # rdd.getNumPartitions() not supported on Serverless - just coalesce
+        print(f"📊 Coalescing to {num_partitions} partitions")
         return df.coalesce(num_partitions)
     else:
-        print(f"📊 Already at {current_partitions} partitions (target: {num_partitions})")
-        return df
-
+        current_partitions = df.rdd.getNumPartitions()
+        if current_partitions > num_partitions:
+            print(f"📊 Coalescing from {current_partitions} to {num_partitions} partitions")
+            return df.coalesce(num_partitions)
+        else:
+            print(f"📊 Already at {current_partitions} partitions (target: {num_partitions})")
+            return df
 
 def smart_persist(df: DataFrame, storage_level: str = None) -> DataFrame:
     """
     Persist DataFrame with appropriate storage level for environment.
+    Note: persist() is not supported on Databricks Serverless.
 
     Args:
         df: Spark DataFrame to persist
         storage_level: Storage level string (None = use Config default)
 
     Returns:
-        Persisted DataFrame
+        DataFrame (persisted on local, unchanged on Serverless)
     """
+    if Config.is_databricks():
+        # persist() not supported on Serverless - just return df
+        print("💾 Skipping persist (not supported on Serverless)")
+        return df
+    
     from pyspark.storagelevel import StorageLevel
 
     if storage_level is None:
@@ -243,7 +276,6 @@ def smart_persist(df: DataFrame, storage_level: str = None) -> DataFrame:
     print(f"💾 Persisting with storage level: {storage_level}")
 
     return df.persist(level)
-
 
 # ==================================================================
 # PARQUET WRITE UTILITIES
@@ -352,19 +384,29 @@ def check_nulls(df: DataFrame, columns: list = None):
 # ENVIRONMENT INFO
 # ==================================================================
 
-def print_environment_info(spark: SparkSession):
-    """Print current Spark environment configuration."""
+def print_environment_info(spark):
+    """Print Spark environment information."""
     print("\n" + "=" * 70)
     print("SPARK ENVIRONMENT INFO")
     print("=" * 70)
     print(f"Environment: {Config.get_environment()}")
     print(f"Spark Version: {spark.version}")
     print(f"Base Path: {Config.BASE_PATH}")
-    print(f"Shuffle Partitions: {spark.conf.get('spark.sql.shuffle.partitions')}")
-    print(f"Default Parallelism: {spark.conf.get('spark.default.parallelism', 'Not Set')}")
-
+    
+    # Safely get configs (many not available on Serverless)
+    try:
+        shuffle = spark.conf.get('spark.sql.shuffle.partitions')
+        print(f"Shuffle Partitions: {shuffle}")
+    except:
+        print(f"Shuffle Partitions: auto (Serverless)")
+    
+    try:
+        parallelism = spark.conf.get('spark.default.parallelism')
+        print(f"Default Parallelism: {parallelism}")
+    except:
+        print(f"Default Parallelism: Not available (Serverless)")
+    
     if Config.is_databricks():
         print(f"Databricks Runtime: {os.environ.get('DATABRICKS_RUNTIME_VERSION', 'Unknown')}")
-        print(f"AQE Enabled: {spark.conf.get('spark.sql.adaptive.enabled', 'Not Set')}")
-
-    print("=" * 70)
+    
+    print("=" * 70 + "\n")

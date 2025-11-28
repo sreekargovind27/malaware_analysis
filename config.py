@@ -4,7 +4,7 @@ Unified config that works both locally and on Databricks.
 
 Environment Detection:
 - Local: Uses local filesystem paths, local[*] Spark
-- Databricks: Uses DBFS paths, cluster Spark with optimized settings
+- Databricks: Uses Unity Catalog Volumes paths, cluster Spark with optimized settings
 """
 
 import os
@@ -31,9 +31,8 @@ class Config:
     LOCAL_EXECUTOR_MEMORY = "8g"  # Local executor memory
 
     # Path configuration
-    DATABRICKS_BASE_PATH = "/dbfs/mnt/iot23"  # Mounted storage path
-    # Alternative: "dbfs:/iot23" for direct DBFS (without /dbfs prefix)
-
+    DATABRICKS_BASE_PATH = "/Volumes/workspace/malaware_analysis/iot23_data"  # Unity Catalog Volume path
+    
     # Graph building limits (prevent OOM on collect)
     MAX_NODES_TO_COLLECT = 100000  # Max nodes before refusing collect()
 
@@ -62,7 +61,7 @@ class Config:
     # MODE / SAMPLING
     # ==================================================================
 
-    TEST_MODE = True  # Set to True for small test data, False for full 40GB run
+    TEST_MODE = False  # Set to True for small test data, False for full 40GB run
 
     # For Spark feature_engineering: take full data or downsample
     # 1.0 = use 100% of rows; 0.1 = 10%; etc.
@@ -78,11 +77,8 @@ class Config:
     # PROJECT ROOTS / IO PATHS (Environment-Aware)
     # ==================================================================
 
-    # Determine base path inline (avoid circular dependency)
-    if os.path.exists('/dbfs'):
-        BASE_PATH = "/dbfs/mnt/iot23"
-    else:
-        BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
+    # Determine base path - use Unity Catalog Volume on Databricks, local path otherwise
+    BASE_PATH = "/Volumes/workspace/malaware_analysis/iot23_data" if os.path.exists('/dbfs') else os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
 
     @staticmethod
     def get_base_path():
@@ -92,12 +88,11 @@ class Config:
     # Data directories
     DATA_DIR = os.path.join(BASE_PATH, "data")
 
-    RAW_DIR_MESSY = os.path.join(
-        DATA_DIR, "raw_messy_test" if TEST_MODE else "raw_messy"
-    )
-    RAW_DIR_ORIGINAL = os.path.join(
-        DATA_DIR, "raw_test" if TEST_MODE else "raw"
-    )
+    RAW_DIR_MESSY = os.path.join(DATA_DIR, "raw_messy_test" if TEST_MODE else "raw_messy")
+    
+    # On Databricks with Unity Catalog Volumes, files are directly in the volume
+    # On local, they're in a data/raw subdirectory
+    RAW_DIR_ORIGINAL = "/Volumes/workspace/malaware_analysis/iot23_data" if os.path.exists('/dbfs') else os.path.join(DATA_DIR, "raw_test" if TEST_MODE else "raw")
 
     # Outputs
     OUTPUTS_DIR = os.path.join(BASE_PATH, "outputs")
@@ -140,7 +135,8 @@ class Config:
     # Stage 2 outputs
     ENGINEERED_DATA_PATH = os.path.join(STAGE2_PREPARED_DIR, "engineered_flows.parquet")
     DEVICE_FEATURES_PATH = os.path.join(STAGE2_PREPARED_DIR, "device_features.parquet")
-    FEATURE_LIST_PATH = os.path.join(STAGE2_PREPARED_DIR, "feature_list.joblib")
+    FEATURE_LIST_PATH = os.path.join(STAGE2_PREPARED_DIR, "feature_list.json")
+
 
     # Train/Val/Test splits
     TRAIN_PATH = os.path.join(SPLITS_DIR, "train.parquet")
@@ -161,6 +157,9 @@ class Config:
     TRAIN_SET_PATH = TRAIN_PATH
     VAL_SET_PATH = VAL_PATH
     TEST_SET_PATH = TEST_PATH
+
+    # Stage 1 feasibility report
+    FEASIBILITY_SUMMARY = os.path.join(STAGE1_FEASIBILITY_DIR, "feasibility_summary.json")
 
     # ==================================================================
     # FEATURE DEFINITIONS
@@ -249,7 +248,10 @@ class Config:
                  .getOrCreate()
                  )
 
-        spark.sparkContext.setLogLevel("WARN")
+        # Set log level (not supported on serverless)
+        if not Config.is_databricks():
+            spark.sparkContext.setLogLevel("WARN")
+
 
         print(f"✅ Spark session ready: {spark.version}")
         print(f"   Environment: {Config.get_environment()}")
@@ -312,28 +314,35 @@ class Config:
     @staticmethod
     def ensure_output_dirs():
         """Create all necessary output directories"""
-        for dir_path in [
-            Config.RAW_DIR_MESSY,
-            Config.RAW_DIR_ORIGINAL,
-            Config.STAGE1_FEASIBILITY_DIR,
-            Config.STAGE2_PREPARED_DIR,
-            Config.STAGE2_QUALITY_DIR,
-            Config.SPLITS_DIR,
-            Config.NORMALIZED_DIR,
-            Config.GRAPH_DIR,
-            Config.TRADITIONAL_MODELS_DIR,
-            Config.DL_MODELS_DIR,
-            Config.GNN_MODELS_DIR,
-            Config.UNSUPERVISED_MODELS_DIR,
-            Config.BINARY_RESULTS_DIR,
-            Config.MULTICLASS_RESULTS_DIR,
-            Config.FAMILY_RESULTS_DIR,
-            Config.AUTOENCODER_RESULTS_DIR,
-            Config.CLUSTERING_RESULTS_DIR,
-            Config.GAN_RESULTS_DIR,
-            Config.LOGS_DIR,
-        ]:
-            os.makedirs(dir_path, exist_ok=True)
+        if Config.is_databricks():
+            # On Databricks with Unity Catalog Volumes, directories are created automatically
+            # when writing files. No need to pre-create them.
+            print("ℹ️  Running on Databricks - output directories will be created automatically")
+            return
+        else:
+            # Local: use os.makedirs
+            for dir_path in [
+                Config.RAW_DIR_MESSY,
+                Config.RAW_DIR_ORIGINAL,
+                Config.STAGE1_FEASIBILITY_DIR,
+                Config.STAGE2_PREPARED_DIR,
+                Config.STAGE2_QUALITY_DIR,
+                Config.SPLITS_DIR,
+                Config.NORMALIZED_DIR,
+                Config.GRAPH_DIR,
+                Config.TRADITIONAL_MODELS_DIR,
+                Config.DL_MODELS_DIR,
+                Config.GNN_MODELS_DIR,
+                Config.UNSUPERVISED_MODELS_DIR,
+                Config.BINARY_RESULTS_DIR,
+                Config.MULTICLASS_RESULTS_DIR,
+                Config.FAMILY_RESULTS_DIR,
+                Config.AUTOENCODER_RESULTS_DIR,
+                Config.CLUSTERING_RESULTS_DIR,
+                Config.GAN_RESULTS_DIR,
+                Config.LOGS_DIR,
+            ]:
+                os.makedirs(dir_path, exist_ok=True)
 
     @staticmethod
     def set_seeds():

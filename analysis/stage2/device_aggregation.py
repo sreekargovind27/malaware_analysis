@@ -201,10 +201,18 @@ def aggregate_devices_spark(spark):
 
     print("\n🔍 Handling nulls and validating...")
 
-    # Fill null statistics with 0
-    stat_cols = [c for c in device_stats.columns if c not in ["device_ip", "label"]]
+    # Fill null statistics with 0 (only numeric columns)
+    # Exclude string columns from numeric fill
+    string_cols = {"most_common_attack_type", "most_common_malware_family"}
+    stat_cols = [c for c in device_stats.columns if c not in ["device_ip", "label"] and c not in string_cols]
+
     for col in stat_cols:
         device_stats = device_stats.withColumn(col, F.coalesce(F.col(col), F.lit(0.0)))
+
+    # Fill string columns with "Unknown"
+    for col in string_cols:
+        if col in device_stats.columns:
+            device_stats = device_stats.withColumn(col, F.coalesce(F.col(col), F.lit("Unknown")))
 
     # Validate
     validate_dataframe(device_stats, "Device Statistics")

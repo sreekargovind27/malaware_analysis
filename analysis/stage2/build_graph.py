@@ -236,8 +236,10 @@ def build_heterogeneous_graph_spark(spark):
     # Use broadcast joins for small dimension tables (optimization)
     from pyspark.sql.functions import broadcast
 
-    # Persist dimension tables
-    device_nodes = device_nodes.persist()
+    # persist() not supported on Serverless - skip it
+    if not Config.is_databricks():
+        device_nodes = device_nodes.persist()
+
     service_nodes = broadcast(service_nodes)
     subnet_nodes = broadcast(subnet_nodes)
 
@@ -422,12 +424,28 @@ def build_heterogeneous_graph_spark(spark):
     # 8. SAVE ARTIFACTS
     # ========================================
 
-    os.makedirs(Config.GRAPH_DIR, exist_ok=True)
+    # Create directory (skip on Databricks - created automatically)
+    if not Config.is_databricks():
+        os.makedirs(Config.GRAPH_DIR, exist_ok=True)
 
     # Save graph
     print(f"\n💾 Saving graph to: {Config.HETERO_GRAPH_PATH}")
-    torch.save(data, Config.HETERO_GRAPH_PATH)
-    print(f"   ✅ Graph saved")
+    
+    if Config.is_databricks():
+        # Serialize to bytes, save via Spark (only way on Serverless)
+        import io
+        buffer = io.BytesIO()
+        torch.save(data, buffer)
+        graph_bytes = buffer.getvalue()
+        
+        # Save as parquet with binary column
+        graph_parquet_path = Config.HETERO_GRAPH_PATH.replace(".pt", ".parquet")
+        graph_df = spark.createDataFrame([(bytearray(graph_bytes),)], ["data"])
+        graph_df.coalesce(1).write.mode("overwrite").parquet(graph_parquet_path)
+        print(f"   ✅ Graph saved as: {graph_parquet_path}")
+    else:
+        torch.save(data, Config.HETERO_GRAPH_PATH)
+        print(f"   ✅ Graph saved")
 
     # Save node mappings
     device_map_rows = device_nodes.select("device_ip", "device_id").collect()
@@ -441,8 +459,16 @@ def build_heterogeneous_graph_spark(spark):
     }
 
     mapping_path = os.path.join(Config.GRAPH_DIR, "node_mappings.json")
-    with open(mapping_path, "w") as f:
-        json.dump(node_mappings, f, indent=2)
+    mapping_json = json.dumps(node_mappings, indent=2)
+    
+    if Config.is_databricks() and mapping_path.startswith("/Volumes/"):
+        from pyspark.dbutils import DBUtils
+        dbutils = DBUtils(spark)
+        dbutils.fs.put(mapping_path, mapping_json, overwrite=True)
+    else:
+        with open(mapping_path, "w") as f:
+            f.write(mapping_json)
+    
     print(f"   ✅ Node mappings saved to: {mapping_path}")
 
     # Save graph stats
@@ -458,8 +484,16 @@ def build_heterogeneous_graph_spark(spark):
         "num_edge_types": len(data.edge_types),
     }
 
-    with open(Config.GRAPH_STATS_PATH, "w") as f:
-        json.dump(stats, f, indent=2)
+    stats_json = json.dumps(stats, indent=2)
+    
+    if Config.is_databricks() and Config.GRAPH_STATS_PATH.startswith("/Volumes/"):
+        from pyspark.dbutils import DBUtils
+        dbutils = DBUtils(spark)
+        dbutils.fs.put(Config.GRAPH_STATS_PATH, stats_json, overwrite=True)
+    else:
+        with open(Config.GRAPH_STATS_PATH, "w") as f:
+            f.write(stats_json)
+    
     print(f"   ✅ Graph stats saved to: {Config.GRAPH_STATS_PATH}")
 
     # ========================================
