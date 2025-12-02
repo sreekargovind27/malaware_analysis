@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files (too large for git)
+data/raw/*.csv
+data/processed/*.parquet
+*.parquet
+
+# Model files (can be large)
+models/**/data/
+models/**/*.parquet
+*.pkl
+*.h5
+
+# Reports
+reports/*.pdf
+reports/*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Mac
+.DS_Store
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log

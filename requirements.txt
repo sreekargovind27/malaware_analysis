@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+pyspark
+mcp
+python-dotenv
+aiofiles
+requests

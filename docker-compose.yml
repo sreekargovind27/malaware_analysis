@@ -1,0 +1,31 @@
+
+services:
+  spark:
+    build: .
+    container_name: dic_spark
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./config:/app/config
+      - ./notebooks:/app/notebooks
+    environment:
+      - SPARK_DRIVER_MEMORY=4g
+      - PYSPARK_PYTHON=/usr/local/bin/python
+    mem_limit: 6g
+    cpus: 2
+    stdin_open: true
+    tty: true
+
+  mcp-server:
+    build: .
+    container_name: dic_mcp
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./models:/app/models
+    ports:
+      - "8000:8000"
+    depends_on:
+      - spark
+    command: python src/mcp/mcp_server.py
