@@ -35,3 +35,5 @@ data/processed/
 
 # Databricks
 .dbfs/
+
+iot23_temp/
