@@ -22,10 +22,6 @@ from input_validator import validate_traffic_data
 from report_generator import NetworkSecurityReportGenerator
 from analysis_orchestrator import TrafficAnalysisOrchestrator
 from response_formatter import format_comprehensive_response, format_quick_summary
-from model_loaders import MultiModelLoader
-from multi_stage_orchestrator import MultiStageOrchestrator
-from live_response_formatter import format_live_thinking
-
 
 # Global variables
 spark = None
@@ -37,8 +33,6 @@ cve_collection = None
 embedding_model = None
 report_generator = None
 orchestrator = None
-multi_stage_orchestrator = None
-all_models = None
 
 
 def initialize_spark():
@@ -90,22 +84,6 @@ def initialize_spark():
     )
     print("✓ Analysis orchestrator initialized")
 
-    # Load all models (LightGBM + VAE + Neural Net)
-    global all_models, multi_stage_orchestrator
-    model_loader = MultiModelLoader()
-    all_models = model_loader.load_all()
-    
-    # Initialize multi-stage orchestrator
-    multi_stage_orchestrator = MultiStageOrchestrator(
-        spark=spark,
-        models=all_models,
-        ml_data=ml_data,
-        rag_collection=cve_collection,
-        embedding_model=embedding_model
-    )
-    print("✓ Multi-stage orchestrator initialized")
-
-
     print("\n✅ System ready!")
 
 
@@ -119,7 +97,7 @@ async def list_tools() -> list[Tool]:
     return [
         # NEW COMPREHENSIVE TOOL
         Tool(
-            name="analyze_traffic_multistage_old",
+            name="analyze_traffic_comprehensive",
             description="""
             🎯 PRIMARY TOOL - Comprehensive IoT traffic security analysis.
 
@@ -187,48 +165,6 @@ async def list_tools() -> list[Tool]:
         ),
 
         # EXISTING TOOLS
-        Tool(
-            name="analyze_traffic_comprehensive",
-            description="""
-            🎯 MULTI-STAGE ANALYSIS - Complete 3-stage pipeline with live thinking.
-            
-            This tool provides transparent, step-by-step analysis:
-            
-            STAGE 1: Binary Classification (LightGBM + VAE)
-            - Determines if traffic is malicious or benign
-            - Shows confidence scores and probabilities
-            
-            STAGE 2: Attack Type Classification (Neural Network)
-            - Identifies specific malware family (PortScan, Mirai, etc.)
-            - High accuracy (99.86%) classification
-            
-            STAGE 3: Vulnerability Intelligence (RAG)
-            - Automatically searches 389 CVE database
-            - Returns related vulnerabilities with CVSS scores
-            
-            Features:
-            - Live progress updates showing which models are running
-            - Transparent decision-making process
-            - Actionable recommendations based on threat type
-            - Option to generate detailed PDF report
-            
-            Use this for comprehensive security assessment with full visibility.
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "duration": {"type": "number", "description": "Connection duration in seconds"},
-                    "orig_bytes": {"type": "number", "description": "Bytes sent by originator"},
-                    "resp_bytes": {"type": "number", "description": "Bytes sent by responder"},
-                    "orig_pkts": {"type": "integer", "description": "Packets sent by originator"},
-                    "resp_pkts": {"type": "integer", "description": "Packets sent by responder"},
-                    "orig_port": {"type": "integer", "description": "Source port (optional)"},
-                    "resp_port": {"type": "integer", "description": "Destination port (optional)"},
-                    "proto": {"type": "string", "description": "Protocol: tcp, udp, icmp (optional)"}
-                },
-                "required": ["duration", "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts"]
-            }
-        ),
         Tool(
             name="validate_network_traffic",
             description="""
@@ -446,47 +382,6 @@ Please try again or use individual tools for specific analysis.
             print(f"\n❌ Error: {e}")
             return [TextContent(type="text", text=error_msg)]
 
-
-    elif name == "analyze_traffic_multistage":
-        print("\n" + "="*70)
-        print("🚀 MULTI-STAGE ANALYSIS PIPELINE")
-        print("="*70)
-        
-        # Validate input
-        is_valid, cleaned_data, validation_report = validate_traffic_data(arguments)
-        
-        if not is_valid:
-            return [TextContent(type="text", text=f"""
-❌ **INPUT VALIDATION FAILED**
-
-{validation_report}
-
-Please provide valid network traffic data.
-""")]
-        
-        # Run multi-stage analysis
-        try:
-            results = multi_stage_orchestrator.run_analysis(cleaned_data)
-            response_text = format_live_thinking(results)
-            
-            print("="*70)
-            print("✅ MULTI-STAGE ANALYSIS COMPLETE")
-            print("="*70)
-            
-            return [TextContent(type="text", text=response_text)]
-            
-        except Exception as e:
-            error_msg = f"""
-❌ **ANALYSIS ERROR**
-
-{str(e)}
-
-Please try again or use the standard analysis tool.
-"""
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return [TextContent(type="text", text=error_msg)]
     elif name == "validate_network_traffic":
         data = arguments.get("data", {})
         is_valid, cleaned_data, report = validate_traffic_data(data)
@@ -784,7 +679,7 @@ async def main():
 
     async with stdio_server() as (read_stream, write_stream):
         print("\n✓ MCP Server running on stdio")
-        print("✓ 11 tools available")
+        print("✓ 10 tools available")
         print("✓ Ready for requests\n")
         await server.run(
             read_stream,

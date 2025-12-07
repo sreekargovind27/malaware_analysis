@@ -1,8 +1,22 @@
-pandas
-numpy
+# MCP Server Core
+mcp
+
+# Model Loading
+torch
 scikit-learn
 pyspark
-mcp
+
+# RAG Components
+chromadb
+sentence-transformers
+
+# Utilities
 python-dotenv
+pydantic
+loguru
 aiofiles
 requests
+
+# For response formatting
+pandas
+numpy

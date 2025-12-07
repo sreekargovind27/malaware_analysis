@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 ENV/
+env/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -14,24 +15,39 @@ ENV/
 
 # Data files (too large for git)
 data/raw/*.csv
+data/raw/*.parquet
 data/processed/*.parquet
 *.parquet
 
-# Model files (can be large)
-models/**/data/
-models/**/*.parquet
-*.pkl
-*.h5
+# IMPORTANT: Keep sample data for grading!
+!data/sample_input/*.json
+!data/expected_output/*.json
 
-# Reports
+# Model files (keep structure, exclude large binaries if needed)
+# If models are <100MB total, comment these out
+# models/**/data/*.parquet
+# models/**/*.bin
+
+# Keep these model files for grading (they're needed to run MCP)
+!models/lightgbm_classifier/
+!models/neural_net_multiclass/
+!models/vae_binary/
+!models/lightgbm_metrics.pkl
+!models/feature_importance.txt
+
+# Reports (keep final only)
 reports/*.pdf
 reports/*.png
+# IMPORTANT: Keep Phase 3 report!
+!reports/Phase3report.pdf
+!Phase3report.pdf
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.iml
 
 # Mac
 .DS_Store
@@ -40,3 +56,23 @@ reports/*.png
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Logs
+*.log
+*.tmp
+
+# Environment variables
+.env
+.env.local
+
+# ChromaDB (RAG database - can be regenerated)
+chroma_db/
+*.sqlite3
+
+# Temporary test files
+test_output/
+temp/
+
+# PyCharm specific
+.idea/
+out/
